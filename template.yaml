@@ -103,9 +103,6 @@ Resources:
       RetentionPolicy: Retain
     Metadata:
       BuildMethod: python3.12
-      BuildProperties:
-        # pip install into python/lib/python3.12/site-packages
-        ArtifactName: dependencies
 
   # ── Security Group for Lambda ENIs ───────────────────────────────────────
   CipherWeaveLambdaSG:
