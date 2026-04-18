@@ -1,0 +1,125 @@
+# CipherWeave — Architectural Decisions
+
+This document records deliberate design choices, trade-offs, and assumptions made during implementation of CipherWeave v0.1.
+
+---
+
+## ADR-001: Fail-Secure Default — QUANTUM_SAFE for Unknown State
+
+**Decision**: Any condition that cannot be evaluated (new agent, unknown topology, drift anomaly) defaults to `QUANTUM_SAFE`, not to a lower profile.
+
+**Rationale**: The cost of a false positive (encrypting with a stronger cipher than necessary) is a small computational overhead. The cost of a false negative (sending PHI over AES-128 because the graph had no history) is a compliance violation and potential breach. We chose the conservative failure mode.
+
+**Trade-off**: New agents incur `QUANTUM_SAFE` overhead for their first request. Operators should pre-seed the Memgraph topology and warm the `DriftDetector` history via `log_decision()` before production traffic.
+
+---
+
+## ADR-002: MockRiskGraph for Testing (No Memgraph in CI)
+
+**Decision**: `MockRiskGraph` mirrors the full `RiskGraph` API using in-memory dicts and list traversal. Tests import it directly from `risk_engine.py`.
+
+**Rationale**: Spinning up a real Memgraph container in every CI run adds latency, flakiness, and infrastructure dependency. The mock gives deterministic, fast tests while keeping the production code path identical.
+
+**Trade-off**: The mock does not validate Cypher query correctness. The `seed_graph.py` script and manual integration tests against a live Memgraph validate the real query path.
+
+---
+
+## ADR-003: Stateless HKDF — One Master Secret Per Invocation
+
+**Decision**: `CipherJanitor.get_master_secret()` fetches a fresh MSK from KMS on every `get_encryption_strategy()` call. The MSK is never cached in plaintext.
+
+**Rationale**: The spec says "NEVER cache plaintext beyond single tool invocation." Caching the MSK would mean a memory disclosure attack could recover all derived keys for the cache's lifetime. Statelessness is the simpler, safer choice.
+
+**Trade-off**: Additional KMS latency per call (~1–3ms in production). Mitigated in local dev by `os.urandom()`. In production, AWS KMS `GenerateDataKey` can be batched or pre-fetched with envelope encryption, but this is outside v0.1 scope.
+
+---
+
+## ADR-004: Salt Reuse Detection via In-Process Set
+
+**Decision**: `CipherJanitor` tracks all `(salt_hex, info)` pairs seen in a single process lifetime in a Python `set`. Reuse raises `SaltReuseError`.
+
+**Rationale**: RFC 5869 requires unique salts. A same-salt re-derivation with the same IKM yields identical OKM — a key reuse vulnerability. The in-process set catches this for the common case of programmatic misuse.
+
+**Limitation**: Across process restarts or multiple replicas, salt reuse is not detected. Production systems should use a distributed salt ledger (e.g., Redis with TTL) for cross-instance protection. The spec's 10ms budget makes a Redis round-trip risky for v0.1, so we defer to v0.2.
+
+---
+
+## ADR-005: Memory Sanitation — Best-Effort via ctypes
+
+**Decision**: `_zero_bytes()` attempts to overwrite the internal buffer of Python `bytes` objects using `ctypes.memmove`. For `bytearray`, it uses index assignment (reliable).
+
+**Rationale**: Python's immutable `bytes` objects cannot be zeroed via normal Python code. The `ctypes` approach targets the CPython object layout, which is an implementation detail. We document this as best-effort.
+
+**Trade-off**: This is CPython-specific and may break on PyPy or future CPython versions. The safer alternative is to use `bytearray` throughout the key derivation pipeline, converting to `bytes` only at API boundaries. Refactoring to use `bytearray` everywhere is a v0.2 target.
+
+---
+
+## ADR-006: Single MCP Tool
+
+**Decision**: The entire CipherWeave surface is exposed as a single MCP tool: `get_encryption_strategy()`. No separate tools for authorization checks, key listing, or profile queries.
+
+**Rationale**: The spec mandates a single tool. This also enforces the "agent invokes, CipherWeave decides" philosophy — there is no API for an agent to query what profiles are available and then request a specific one separately (which would allow bypass).
+
+---
+
+## ADR-007: Routing Logic — Explicit Table, Not ML
+
+**Decision**: Risk routing uses a deterministic priority table (HIPAA → QUANTUM_SAFE, GDPR → HARDENED, etc.) rather than a learned model.
+
+**Rationale**: An ML model for compliance routing is a liability: it can be fooled, it requires training data, and its decisions are opaque to auditors. A static table is auditable, reproducible, and legally defensible. The spec explicitly documents the routing table.
+
+**Trade-off**: New regulations or edge cases require a code change and deployment, not a model update. Acceptable for v0.1.
+
+---
+
+## ADR-008: Hybrid Keypair — Public Keys Only in Response
+
+**Decision**: `get_encryption_strategy()` returns only the public components of the hybrid keypair (`x25519_public`, `mlkem_public`). Private keys are never included in the response.
+
+**Rationale**: The response is an MCP tool output that may be logged, transmitted to the agent, or stored in audit logs. Private key material must never leave the CipherWeave process boundary.
+
+**Implication**: The current architecture generates the keypair server-side and discards the private key after returning the response. In production, the server would encapsulate the ML-KEM key and return the ciphertext alongside the encapsulation key, so the agent can derive the shared secret. This is the full DHKE flow — deferred to v0.2 because it requires a two-phase protocol.
+
+---
+
+## ADR-009: DriftDetector — Rolling Window, In-Memory
+
+**Decision**: Agent history is stored in a `deque(maxlen=window_size)` in-process. No persistence across restarts.
+
+**Rationale**: Persistence would require a database write on every decision, adding latency. For v0.1, we accept that a process restart clears history (treating the agent as "new" → QUANTUM_SAFE override). This is fail-secure.
+
+**Production path**: Persist decision records to Memgraph or Redis with a TTL equal to the window duration. Query on startup to pre-warm the deque.
+
+---
+
+## ADR-010: FastMCP — stdio Transport for v0.1
+
+**Decision**: The server uses `transport="stdio"` for MCP communication, matching the default for embedded MCP agents.
+
+**Rationale**: HTTP transport adds network setup complexity. For v0.1 local development, stdio is sufficient and matches how Claude Code and similar agents invoke MCP tools.
+
+**Production path**: Switch to `transport="http"` with TLS and add the `AuthMiddleware` to validate `X-Agent-ID` headers at the HTTP layer.
+
+---
+
+## ADR-011: mlkem Package — Stub Fallback
+
+**Decision**: If the `mlkem` package is not installed, `cipher_janitor.py` falls back to `os.urandom()` stubs of the correct key sizes.
+
+**Rationale**: `mlkem` (FIPS 203 ML-KEM-768) is a specialized package that may not be available in all environments. The stub allows tests and local development to proceed without a native ML-KEM implementation, while clearly logging a warning.
+
+**Requirement**: Production deployments MUST install `mlkem` and verify the stub is not active before handling real key material.
+
+---
+
+## ADR-012: < 10ms Budget — In-Process Graph Only
+
+**Decision**: The 10ms budget is achievable only with the `MockRiskGraph` (in-process). A live Memgraph connection adds ~2–5ms for a Bolt round-trip on LAN.
+
+**Mitigation strategies for production**:
+1. Connection pooling (persistent Bolt connections, not per-request)
+2. Memgraph read replicas co-located with the CipherWeave process
+3. Aggressive Cypher query optimization (cover indexes on `agent_id`, `url`)
+4. Pre-computed risk score cache with TTL (invalidated on graph mutations)
+
+The benchmark suite tests against `MockRiskGraph` to validate the non-graph overhead is < 10ms, serving as the upper bound for optimization targets.
