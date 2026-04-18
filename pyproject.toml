@@ -16,7 +16,6 @@ dependencies = [
     "boto3>=1.34.0",
     "python-dotenv>=1.0.0",
     "mangum>=0.17.0",          # ASGI adapter for AWS Lambda + API Gateway
-    "mlkem>=0.1.0",
 ]
 
 [project.optional-dependencies]
