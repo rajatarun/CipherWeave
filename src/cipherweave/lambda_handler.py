@@ -1,13 +1,12 @@
 """Lambda entry point — wraps the FastMCP ASGI app with Mangum.
 
 Cold-start flow:
-  1. Module loads; Mangum+FastMCP app are created immediately (no I/O).
-  2. First request triggers _ensure_init(), which connects Memgraph + KMS.
-  3. Subsequent warm invocations skip init entirely.
-
-Deferred init means an import-time Memgraph timeout no longer returns 500
-for every request — the first request may be slow, but it will produce a
-real error message rather than a silent Lambda crash.
+  1. Module loads; persistent event loop + ASGI app created (no I/O).
+  2. First request calls _ensure_init():
+     a. Connects Memgraph + wires KMS/DriftDetector.
+     b. Manually fires the ASGI lifespan startup so FastMCP's internal
+        task group is initialized before Mangum handles any HTTP request.
+  3. Warm invocations skip init entirely.
 """
 
 from __future__ import annotations
@@ -35,18 +34,47 @@ from cipherweave.risk_engine import RiskGraph
 from cipherweave.server import inject_components, mcp
 
 # ---------------------------------------------------------------------------
-# Persistent event loop — created once, reused by both _ensure_init and Mangum.
-# asyncio.run() destroys the loop after use; Mangum's get_event_loop() then
-# raises RuntimeError on Python 3.12. A module-level loop avoids this.
+# Persistent event loop — module-level so both init and Mangum share it.
+# asyncio.run() destroys the loop; Mangum's get_event_loop() then raises
+# RuntimeError on Python 3.12. A single persistent loop avoids this.
 # ---------------------------------------------------------------------------
 _loop = asyncio.new_event_loop()
 asyncio.set_event_loop(_loop)
+
+# Build the ASGI app once at module load (no I/O here)
+_asgi_app = mcp.http_app(stateless_http=True)
 
 # ---------------------------------------------------------------------------
 # Deferred initialization state
 # ---------------------------------------------------------------------------
 _initialized = False
-_init_error: Exception | None = None
+
+
+async def _start_lifespan(app) -> None:
+    """Send ASGI lifespan.startup to app and wait for startup.complete.
+
+    FastMCP 3.x requires the ASGI lifespan to run before it will handle
+    HTTP requests (its internal anyio task group is created during startup).
+    Mangum's built-in lifespan support is unreliable in the Lambda Python
+    3.12 runtime, so we drive it manually here once per cold start.
+    """
+    startup_done = asyncio.Event()
+    receive_queue: asyncio.Queue = asyncio.Queue()
+    await receive_queue.put({"type": "lifespan.startup"})
+
+    async def receive():
+        return await receive_queue.get()
+
+    async def send(message):
+        if message["type"] == "lifespan.startup.complete":
+            startup_done.set()
+
+    # Run lifespan as a background task so it stays alive during requests
+    _loop.create_task(
+        app({"type": "lifespan", "asgi": {"version": "3.0", "spec_version": "2.0"}}, receive, send)
+    )
+    await asyncio.wait_for(startup_done.wait(), timeout=15)
+    logger.info("FastMCP ASGI lifespan started")
 
 
 async def _async_init() -> None:
@@ -73,27 +101,19 @@ async def _async_init() -> None:
         settings.memgraph_port,
         "LOCAL" if settings.use_local_kms else (settings.kms_key_id or "none")[:20],
     )
+    await _start_lifespan(_asgi_app)
 
 
 def _ensure_init() -> None:
-    global _initialized, _init_error
+    global _initialized
     if _initialized:
         return
-    try:
-        _loop.run_until_complete(_async_init())
-        _initialized = True
-        _init_error = None
-    except Exception as exc:
-        _init_error = exc
-        logger.exception("CipherWeave init failed: %s", exc)
-        raise
+    _loop.run_until_complete(_async_init())
+    _initialized = True
 
 
-# ---------------------------------------------------------------------------
-# ASGI app + Mangum handler
-# ---------------------------------------------------------------------------
-_asgi_app = mcp.http_app()
-_mangum = Mangum(_asgi_app, lifespan="on")
+# Mangum wraps the ASGI app; lifespan is driven manually above
+_mangum = Mangum(_asgi_app, lifespan="off")
 
 
 def handler(event: dict, context: object) -> dict:
@@ -101,7 +121,7 @@ def handler(event: dict, context: object) -> dict:
     try:
         _ensure_init()
     except Exception as exc:
-        logger.error("Initialization error: %s", exc)
+        logger.exception("Initialization error")
         return {
             "statusCode": 503,
             "headers": {"Content-Type": "application/json"},
