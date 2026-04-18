@@ -96,6 +96,14 @@ async def _dispatch(event: dict) -> dict:
     http_ctx = event.get("requestContext", {}).get("http", {})
     method = http_ctx.get("method", "GET").upper()
     path = event.get("rawPath", "/")
+
+    # HTTP API with a named stage includes the stage prefix in rawPath
+    # (e.g. /prod/mcp). Strip it so FastMCP sees /mcp.
+    stage = event.get("requestContext", {}).get("stage", "")
+    if stage and stage != "$default":
+        prefix = f"/{stage}"
+        if path.startswith(prefix):
+            path = path[len(prefix):] or "/"
     query_string = event.get("rawQueryString", "").encode()
     raw_headers = event.get("headers", {}) or {}
 
@@ -168,7 +176,8 @@ async def _dispatch(event: dict) -> dict:
 # ---------------------------------------------------------------------------
 def handler(event: dict, context: object) -> dict:
     # Temporary debug probe — remove once path routing is confirmed
-    if event.get("rawPath", "").rstrip("/") == "/_debug":
+    raw = event.get("rawPath", "")
+    if raw.rstrip("/").endswith("/_debug"):
         return {
             "statusCode": 200,
             "headers": {"Content-Type": "application/json"},

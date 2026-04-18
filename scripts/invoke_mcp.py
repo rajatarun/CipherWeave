@@ -18,9 +18,14 @@ import ssl
 import sys
 import urllib.parse
 
-BASE_URL = "https://mt0otvflba.execute-api.us-east-1.amazonaws.com/prod"
-MCP_PATH = "/prod/mcp"
-HOST = "mt0otvflba.execute-api.us-east-1.amazonaws.com"
+import os
+
+BASE_URL = os.environ.get(
+    "CIPHERWEAVE_URL",
+    "https://mt0otvflba.execute-api.us-east-1.amazonaws.com/prod",
+).rstrip("/")
+MCP_PATH = "/mcp"
+HOST = BASE_URL.removeprefix("https://").split("/")[0]
 
 
 def rpc(method: str, params: dict, req_id: int) -> dict:
