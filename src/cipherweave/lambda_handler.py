@@ -93,7 +93,7 @@ def _ensure_init() -> None:
 # ASGI app + Mangum handler
 # ---------------------------------------------------------------------------
 _asgi_app = mcp.http_app()
-_mangum = Mangum(_asgi_app, lifespan="off")
+_mangum = Mangum(_asgi_app, lifespan="on")
 
 
 def handler(event: dict, context: object) -> dict:
