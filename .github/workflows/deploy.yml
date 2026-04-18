@@ -291,7 +291,7 @@ jobs:
 
           echo "Testing: $FUNCTION_ARN"
 
-          PAYLOAD=$(cat <<'EOF'
+          cat > /tmp/smoke_payload.json <<'EOF'
           {
             "version": "2.0",
             "routeKey": "POST /mcp",
@@ -303,16 +303,26 @@ jobs:
             "isBase64Encoded": false
           }
           EOF
-          )
 
           aws lambda invoke \
             --function-name "$FUNCTION_ARN" \
-            --payload "$PAYLOAD" \
-            /tmp/smoke_response.json 2>&1 || true
+            --payload file:///tmp/smoke_payload.json \
+            --cli-binary-format raw-in-base64-out \
+            --log-type Tail \
+            --query 'LogResult' \
+            --output text \
+            /tmp/smoke_response.json | base64 -d || true
 
+          echo ""
           echo "=== Smoke Test Response ==="
+          if [ ! -f /tmp/smoke_response.json ]; then
+            echo "❌ No response file — lambda invoke failed"
+            exit 1
+          fi
           cat /tmp/smoke_response.json | jq . || cat /tmp/smoke_response.json
-          echo "✅ Smoke test complete"
+
+          STATUS=$(cat /tmp/smoke_response.json | jq -r '.statusCode // "unknown"')
+          echo "✅ Smoke test complete (statusCode=$STATUS)"
 
       - name: Smoke test summary
         run: |
