@@ -140,6 +140,11 @@ def main() -> None:
                 "data_metadata": {
                     "classification": args.classification,
                     "tags": args.tags,
+                    "data_type": "user_analytics",
+                    "description": "User behavioural analytics including session tracking and usage patterns collected by agent-analytics on behalf of end users",
+                    "contains_pii": True,
+                    "cross_border_transfer": True,
+                    "retention_days": 365,
                 },
             },
         },
