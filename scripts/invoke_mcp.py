@@ -2,24 +2,25 @@
 """
 JSON-RPC over HTTP — CipherWeave MCP tool invocation.
 
+FastMCP 2.x uses Streamable HTTP transport: POST /mcp may return
+text/event-stream. We read line-by-line and stop at the first data: event
+so the connection is not held open indefinitely.
+
 Usage:
     python scripts/invoke_mcp.py
     python scripts/invoke_mcp.py --agent agent-analytics --classification CONFIDENTIAL
 """
 
 import argparse
+import http.client
 import json
+import ssl
 import sys
-import urllib.error
-import urllib.request
+import urllib.parse
 
 BASE_URL = "https://mt0otvflba.execute-api.us-east-1.amazonaws.com/prod"
-MCP_ENDPOINT = f"{BASE_URL}/mcp"
-
-HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "application/json, text/event-stream",
-}
+MCP_PATH = "/prod/mcp"
+HOST = "mt0otvflba.execute-api.us-east-1.amazonaws.com"
 
 
 def rpc(method: str, params: dict, req_id: int) -> dict:
@@ -27,24 +28,49 @@ def rpc(method: str, params: dict, req_id: int) -> dict:
         {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}
     ).encode()
 
-    req = urllib.request.Request(MCP_ENDPOINT, data=payload, headers=HEADERS, method="POST")
+    ctx = ssl.create_default_context()
+    conn = http.client.HTTPSConnection(HOST, timeout=30, context=ctx)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode()
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode()
-        print(f"HTTP {exc.code}: {body}", file=sys.stderr)
-        sys.exit(1)
+        conn.request(
+            "POST",
+            MCP_PATH,
+            body=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Content-Length": str(len(payload)),
+            },
+        )
+        resp = conn.getresponse()
 
-    # Streamable HTTP may return SSE lines; extract the JSON data line if so
-    if raw.startswith("data:") or "\ndata:" in raw:
-        for line in raw.splitlines():
-            line = line.strip()
-            if line.startswith("data:"):
-                raw = line[len("data:"):].strip()
-                break
+        if resp.status >= 400:
+            body = resp.read().decode()
+            print(f"HTTP {resp.status}: {body}", file=sys.stderr)
+            sys.exit(1)
 
-    return json.loads(raw)
+        content_type = resp.getheader("Content-Type", "")
+
+        # SSE stream — read line-by-line, stop at first data: event
+        if "text/event-stream" in content_type:
+            result_json = None
+            while True:
+                line = resp.readline()
+                if not line:
+                    break
+                line = line.decode().rstrip("\r\n")
+                if line.startswith("data:"):
+                    result_json = line[len("data:"):].strip()
+                    break
+            if result_json is None:
+                print("SSE stream ended without data event", file=sys.stderr)
+                sys.exit(1)
+            return json.loads(result_json)
+
+        # Plain JSON response
+        return json.loads(resp.read().decode())
+
+    finally:
+        conn.close()
 
 
 def main() -> None:
@@ -67,8 +93,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-
-    print(f"Endpoint : {MCP_ENDPOINT}")
+    print(f"Endpoint : {BASE_URL}/mcp")
     print(f"Agent    : {args.agent}")
     print(f"Target   : {args.url}")
     print(f"Class    : {args.classification}")
