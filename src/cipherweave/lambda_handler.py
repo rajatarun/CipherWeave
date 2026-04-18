@@ -71,14 +71,18 @@ async def _async_init() -> None:
         risk_graph = MockRiskGraph()
 
     kms_client = None
+    bedrock_client = None
     if not settings.use_local_kms and settings.kms_key_id:
         import boto3
         kms_client = boto3.client("kms", region_name=settings.aws_region)
+        bedrock_client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+        logger.info("Bedrock policy inference enabled (model=%s)", settings.bedrock_inference_model_id)
 
     inject_components(
         risk_graph,
         CipherJanitor(kms_client=kms_client, master_key_id=settings.kms_key_id),
         DriftDetector(window_size=settings.drift_window_size),
+        bedrock_client=bedrock_client,
     )
     logger.info(
         "CipherWeave initialized — Memgraph=%s:%s",
