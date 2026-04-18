@@ -79,10 +79,24 @@ def _invoke_bedrock_sync(client: Any, model_id: str, metadata: dict) -> dict:
     response = client.converse(
         modelId=model_id,
         messages=[{"role": "user", "content": [{"text": prompt}]}],
-        inferenceConfig={"maxTokens": 300, "temperature": 0},
+        inferenceConfig={"maxTokens": 512, "temperature": 0},
     )
-    text = response["output"]["message"]["content"][0]["text"].strip()
-    return json.loads(text)
+    content = response.get("output", {}).get("message", {}).get("content", [])
+    text = content[0]["text"].strip() if content else ""
+
+    # Strip markdown code fences the model may add despite being told not to
+    if text.startswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(lines[1:-1]).strip()
+
+    if not text:
+        stop_reason = response.get("stopReason", "unknown")
+        raise ValueError(f"empty response from Bedrock model (stopReason={stop_reason})")
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise ValueError(f"model returned non-JSON: {text[:300]!r}") from None
 
 
 async def infer_policy_from_metadata(
@@ -104,8 +118,6 @@ async def infer_policy_from_metadata(
             result = await loop.run_in_executor(
                 None, _invoke_bedrock_sync, bedrock_client, model_id, data_metadata
             )
-        except json.JSONDecodeError as exc:
-            raise MetadataInferenceError("bedrock_response", f"model returned non-JSON: {exc}") from exc
         except Exception as exc:
             raise MetadataInferenceError("bedrock_call", str(exc)) from exc
 
