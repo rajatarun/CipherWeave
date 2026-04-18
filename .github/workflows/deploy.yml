@@ -334,7 +334,7 @@ jobs:
             "routeKey": "POST /mcp",
             "rawPath": "/mcp",
             "rawQueryString": "",
-            "headers": {"content-type": "application/json", "x-agent-id": "agent-analytics"},
+            "headers": {"content-type": "application/json", "accept": "application/json, text/event-stream", "x-agent-id": "agent-analytics"},
             "requestContext": {"http": {"method": "POST", "path": "/mcp", "protocol": "HTTP/1.1"}, "stage": "$default"},
             "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"smoke-test\",\"version\":\"0.1\"}}}",
             "isBase64Encoded": false
