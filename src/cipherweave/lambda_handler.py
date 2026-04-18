@@ -1,31 +1,34 @@
-"""Lambda entry point — wraps the FastMCP ASGI app with Mangum.
+"""Lambda entry point — minimal async API GW v2 → ASGI adapter for FastMCP 3.x.
 
-Cold-start flow:
-  1. Module loads; persistent event loop + ASGI app created (no I/O).
-  2. First request calls _ensure_init():
-     a. Connects Memgraph + wires KMS/DriftDetector.
-     b. Manually fires the ASGI lifespan startup so FastMCP's internal
-        task group is initialized before Mangum handles any HTTP request.
-  3. Warm invocations skip init entirely.
+Why no Mangum:
+  Mangum is synchronous and calls loop.run_until_complete() internally.
+  When our handler already runs inside loop.run_until_complete(), Mangum's
+  nested call raises "This event loop is already running" on Python 3.12.
+
+Why lifespan per-invocation:
+  FastMCP 3.x uses contextvars internally. __aenter__() tokens must be
+  reset in the same Context they were created in. Running lifespan startup
+  once at cold-start and dispatch in subsequent run_until_complete() calls
+  puts them in different Contexts → ValueError on token.reset().
+  Per-invocation async-with keeps everything in one Context per call.
+  Memgraph / KMS / DriftDetector singletons are module-level and survive
+  across Lambda invocations, so there is no reconnect overhead.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
+from io import BytesIO
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=os.environ.get("CIPHERWEAVE_LOG_LEVEL", "INFO"),
     format="%(levelname)s %(name)s %(message)s",
 )
-
-try:
-    from mangum import Mangum
-except ImportError as exc:
-    raise RuntimeError("mangum is required: pip install mangum") from exc
 
 from cipherweave.cipher_janitor import CipherJanitor
 from cipherweave.config import settings
@@ -34,27 +37,18 @@ from cipherweave.risk_engine import RiskGraph
 from cipherweave.server import inject_components, mcp
 
 # ---------------------------------------------------------------------------
-# Persistent event loop — module-level so both init and Mangum share it.
-# asyncio.run() destroys the loop; Mangum's get_event_loop() then raises
-# RuntimeError on Python 3.12. A single persistent loop avoids this.
+# Persistent event loop — one loop for the lifetime of the Lambda container.
 # ---------------------------------------------------------------------------
 _loop = asyncio.new_event_loop()
 asyncio.set_event_loop(_loop)
 
-# Build the ASGI app once at module load (no I/O here)
+# Build the ASGI app once (no I/O)
 _asgi_app = mcp.http_app(stateless_http=True)
 
 # ---------------------------------------------------------------------------
-# Deferred initialization state
+# Deferred Memgraph / KMS initialization (cached across warm invocations)
 # ---------------------------------------------------------------------------
 _initialized = False
-
-
-async def _start_lifespan(app) -> None:
-    """Enter FastMCP's lifespan context to initialize its internal task group."""
-    ctx = app.lifespan(app)
-    await ctx.__aenter__()
-    logger.info("FastMCP ASGI lifespan started")
 
 
 async def _async_init() -> None:
@@ -76,12 +70,10 @@ async def _async_init() -> None:
         DriftDetector(window_size=settings.drift_window_size),
     )
     logger.info(
-        "CipherWeave initialized — Memgraph=%s:%s KMS=%s",
+        "CipherWeave initialized — Memgraph=%s:%s",
         settings.memgraph_host,
         settings.memgraph_port,
-        "LOCAL" if settings.use_local_kms else (settings.kms_key_id or "none")[:20],
     )
-    await _start_lifespan(_asgi_app)
 
 
 def _ensure_init() -> None:
@@ -92,12 +84,89 @@ def _ensure_init() -> None:
     _initialized = True
 
 
-# Mangum wraps the ASGI app; lifespan is driven manually above
-_mangum = Mangum(_asgi_app, lifespan="off")
+# ---------------------------------------------------------------------------
+# Minimal API Gateway HTTP v2 → ASGI adapter
+# ---------------------------------------------------------------------------
+async def _dispatch(event: dict) -> dict:
+    """Convert an API GW HTTP v2 payload-format-2.0 event to ASGI and run it.
+
+    The FastMCP lifespan is entered and exited within this single coroutine so
+    all ContextVar tokens live in exactly one asyncio Context.
+    """
+    http_ctx = event.get("requestContext", {}).get("http", {})
+    method = http_ctx.get("method", "GET").upper()
+    path = event.get("rawPath", "/")
+    query_string = event.get("rawQueryString", "").encode()
+    raw_headers = event.get("headers", {}) or {}
+
+    headers = [(k.lower().encode(), v.encode()) for k, v in raw_headers.items()]
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": query_string,
+        "root_path": "",
+        "headers": headers,
+        "server": ("lambda", 443),
+    }
+
+    raw_body = event.get("body") or ""
+    body_bytes: bytes = (
+        base64.b64decode(raw_body)
+        if event.get("isBase64Encoded")
+        else (raw_body.encode() if isinstance(raw_body, str) else raw_body)
+    )
+
+    body_sent = False
+    response_complete = asyncio.Event()
+
+    async def receive():
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {"type": "http.request", "body": body_bytes, "more_body": False}
+        # Hold here until the response is fully sent, then signal disconnect.
+        # Returning http.disconnect immediately causes FastMCP to terminate the
+        # SSE session before it sends the response body.
+        await response_complete.wait()
+        return {"type": "http.disconnect"}
+
+    resp_status = 200
+    resp_headers: dict[str, str] = {}
+    resp_body = BytesIO()
+
+    async def send(message: dict) -> None:
+        nonlocal resp_status, resp_headers
+        if message["type"] == "http.response.start":
+            resp_status = message["status"]
+            resp_headers = {
+                k.decode(): v.decode()
+                for k, v in message.get("headers", [])
+            }
+        elif message["type"] == "http.response.body":
+            resp_body.write(message.get("body", b""))
+            if not message.get("more_body", False):
+                response_complete.set()
+
+    async with _asgi_app.lifespan(_asgi_app):
+        await _asgi_app(scope, receive, send)
+
+    return {
+        "statusCode": resp_status,
+        "headers": resp_headers,
+        "body": resp_body.getvalue().decode("utf-8", errors="replace"),
+        "isBase64Encoded": False,
+    }
 
 
+# ---------------------------------------------------------------------------
+# Lambda entry point
+# ---------------------------------------------------------------------------
 def handler(event: dict, context: object) -> dict:
-    """Lambda handler — ensures init before delegating to Mangum."""
     try:
         _ensure_init()
     except Exception as exc:
@@ -107,4 +176,13 @@ def handler(event: dict, context: object) -> dict:
             "headers": {"Content-Type": "application/json"},
             "body": json.dumps({"error": "service_unavailable", "detail": str(exc)}),
         }
-    return _mangum(event, context)
+
+    try:
+        return _loop.run_until_complete(_dispatch(event))
+    except Exception as exc:
+        logger.exception("Dispatch error")
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "internal_error", "detail": str(exc)}),
+        }
