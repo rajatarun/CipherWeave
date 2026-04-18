@@ -228,16 +228,22 @@ jobs:
           echo "Invoking: $SEED_ARN"
           echo "Memgraph target: ${{ needs.deploy.outputs.memgraph_host }}:7687"
 
+          # AWS CLI v2 requires --cli-binary-format raw-in-base64-out for raw JSON payloads
           aws lambda invoke \
             --function-name "$SEED_ARN" \
             --payload '{"RequestType":"Create"}' \
+            --cli-binary-format raw-in-base64-out \
             --log-type Tail \
-            /tmp/seed_response.json \
             --query 'LogResult' \
-            --output text | base64 -d || true
+            --output text \
+            /tmp/seed_response.json | base64 -d || true
 
           echo ""
           echo "=== Seed Lambda Response ==="
+          if [ ! -f /tmp/seed_response.json ]; then
+            echo "❌ No response file — lambda invoke failed"
+            exit 1
+          fi
           cat /tmp/seed_response.json | jq . || cat /tmp/seed_response.json
 
           STATUS=$(cat /tmp/seed_response.json | jq -r '.status // "unknown"')
