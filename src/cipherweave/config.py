@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     # Drift detection
     drift_window_size: int = 100
 
+    # Bedrock policy inference
+    bedrock_inference_model_id: str = "anthropic.claude-haiku-4-5-20251001:0"
+
     # Logging
     log_level: str = "INFO"
 

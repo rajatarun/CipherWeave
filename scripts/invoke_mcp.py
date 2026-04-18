@@ -24,8 +24,9 @@ BASE_URL = os.environ.get(
     "CIPHERWEAVE_URL",
     "https://mt0otvflba.execute-api.us-east-1.amazonaws.com/prod",
 ).rstrip("/")
-MCP_PATH = "/mcp"
-HOST = BASE_URL.removeprefix("https://").split("/")[0]
+_parsed = urllib.parse.urlparse(BASE_URL)
+HOST = _parsed.netloc
+MCP_PATH = _parsed.path.rstrip("/") + "/mcp"
 
 
 def rpc(method: str, params: dict, req_id: int) -> dict:

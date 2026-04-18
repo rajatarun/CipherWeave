@@ -8,10 +8,18 @@ Driver strategy:
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import logging
 from typing import Any
 
-from cipherweave.exceptions import GraphConnectionError, PathNotFoundError, UnauthorizedAgentError
+from cipherweave.exceptions import (
+    GraphConnectionError,
+    MetadataInferenceError,
+    PathNotFoundError,
+    UnauthorizedAgentError,
+)
 from cipherweave.models import PathRiskResult
 from cipherweave.profiles import CipherProfile
 
@@ -39,6 +47,140 @@ _QUANTUM_REGS: frozenset[str] = frozenset({"HIPAA", "ITAR"})
 
 # Regulations that mandate HARDENED minimum
 _HARDENED_REGS: frozenset[str] = frozenset({"GDPR", "PCI_DSS_4", "SOX"})
+
+_VALID_CLASSIFICATIONS: frozenset[str] = frozenset(_CLASSIFICATION_RANK.keys())
+
+_BEDROCK_PROMPT = """\
+You are a cryptographic policy engine. Analyze the data metadata below and determine the appropriate encryption profile.
+
+METADATA:
+{metadata_json}
+
+VALID PROFILES (strongest → weakest):
+- QUANTUM_SAFE  (risk ≥ 0.80): required for HIPAA/ITAR, RESTRICTED/TOP_SECRET data, or active threats
+- HARDENED      (risk 0.60-0.79): required for GDPR/PCI_DSS_4/SOX or CONFIDENTIAL data
+- BALANCED      (risk 0.30-0.59): standard for INTERNAL data with no regulatory burden
+- CHEAP         (risk < 0.30): only for VPC-internal PUBLIC/INTERNAL data with zero regulations
+
+Respond ONLY with valid JSON, no markdown, no extra text.
+
+If you CAN infer the policy:
+{{"can_infer": true, "classification": "<PUBLIC|INTERNAL|CONFIDENTIAL|RESTRICTED|TOP_SECRET>", "regulations": ["<UPPERCASE>"], "profile": "<PROFILE>", "risk_score": <0.0-1.0>, "justification": "<one sentence>"}}
+
+If metadata is missing, ambiguous, or classification is unrecognizable:
+{{"can_infer": false, "error_field": "<field>", "error_reason": "<why>"}}
+
+Be strict: do not guess. If classification is absent or not one of the five valid values, set can_infer=false.\
+"""
+
+
+def _invoke_bedrock_sync(client: Any, model_id: str, metadata: dict) -> dict:
+    prompt = _BEDROCK_PROMPT.format(metadata_json=json.dumps(metadata, indent=2))
+    response = client.converse(
+        modelId=model_id,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": 300, "temperature": 0},
+    )
+    text = response["output"]["message"]["content"][0]["text"].strip()
+    return json.loads(text)
+
+
+async def infer_policy_from_metadata(
+    data_metadata: dict,
+    bedrock_client: Any = None,
+    model_id: str = "anthropic.claude-haiku-4-5-20251001:0",
+) -> tuple[str, list[str], CipherProfile, float, str]:
+    """Strictly validate metadata and infer (classification, regulations, profile, score, justification).
+
+    Uses Bedrock when bedrock_client is provided; otherwise falls back to rule-based inference.
+    Raises MetadataInferenceError if metadata is missing, unrecognized, or the model cannot infer.
+    """
+    if not isinstance(data_metadata, dict):
+        raise MetadataInferenceError("data_metadata", "must be a dict")
+
+    if bedrock_client is not None:
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                None, _invoke_bedrock_sync, bedrock_client, model_id, data_metadata
+            )
+        except json.JSONDecodeError as exc:
+            raise MetadataInferenceError("bedrock_response", f"model returned non-JSON: {exc}") from exc
+        except Exception as exc:
+            raise MetadataInferenceError("bedrock_call", str(exc)) from exc
+
+        if not result.get("can_infer"):
+            raise MetadataInferenceError(
+                result.get("error_field", "unknown"),
+                result.get("error_reason", "model could not infer policy"),
+            )
+
+        classification = result["classification"].upper()
+        if classification not in _VALID_CLASSIFICATIONS:
+            raise MetadataInferenceError(
+                "classification",
+                f"model returned unrecognized value '{classification}'",
+            )
+
+        profile_name = result["profile"].upper()
+        try:
+            profile = CipherProfile[profile_name]
+        except KeyError:
+            raise MetadataInferenceError("profile", f"model returned unrecognized profile '{profile_name}'")  # noqa: B904
+
+        risk_score = float(result["risk_score"])
+        if not (0.0 <= risk_score <= 1.0):
+            raise MetadataInferenceError("risk_score", f"model returned out-of-range value {risk_score}")
+
+        regulations: list[str] = [r.upper() for r in result.get("regulations", [])]
+        justification: str = result.get("justification", "Inferred via Bedrock policy engine")
+        return classification, regulations, profile, risk_score, justification
+
+    # Rule-based fallback (local dev / tests — no Bedrock client)
+    if "classification" not in data_metadata:
+        raise MetadataInferenceError("classification", "field is required to infer encryption policy")
+
+    raw_cls = data_metadata["classification"]
+    if not isinstance(raw_cls, str):
+        raise MetadataInferenceError("classification", f"must be a string, got {type(raw_cls).__name__}")
+
+    classification = raw_cls.upper()
+    if classification not in _VALID_CLASSIFICATIONS:
+        raise MetadataInferenceError(
+            "classification",
+            f"'{raw_cls}' not recognized. Valid values: {sorted(_VALID_CLASSIFICATIONS)}",
+        )
+
+    if "tags" not in data_metadata:
+        raise MetadataInferenceError(
+            "tags",
+            "field is required. Provide an empty list if no regulatory tags apply",
+        )
+
+    tags = data_metadata["tags"]
+    if not isinstance(tags, list):
+        raise MetadataInferenceError("tags", f"must be a list of strings, got {type(tags).__name__}")
+    if not all(isinstance(t, str) for t in tags):
+        raise MetadataInferenceError("tags", "all elements must be strings")
+
+    regulations = [t.upper() for t in tags]
+    # vpc_internal unknown → False (conservative: treat as internet-facing)
+    # threat_proximity unknown → 999 (no known threats)
+    profile, risk_score, justification = _profile_from_risk(
+        regulations=regulations,
+        threat_proximity=999,
+        classification=classification,
+        vpc_internal=False,
+    )
+    return classification, regulations, profile, risk_score, justification
+
+
+def _jit_endpoint_id(url: str) -> str:
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
+
+
+def _jit_asset_id(agent_id: str, url: str) -> str:
+    return f"jit_{hashlib.sha256(f'{agent_id}:{url}'.encode()).hexdigest()[:12]}"
 
 
 def _profile_from_risk(
@@ -292,6 +434,72 @@ class RiskGraph:
         )
         return bool(rows and rows[0]["cnt"] > 0)
 
+    async def upsert_jit_path(
+        self,
+        agent_id: str,
+        destination_url: str,
+        classification: str,
+        regulations: list[str],
+    ) -> str:
+        """JIT-register an agent→endpoint path derived from inferred metadata. Idempotent.
+
+        Returns the endpoint_id (deterministic sha256-based, stable across retries).
+        """
+        endpoint_id = _jit_endpoint_id(destination_url)
+        asset_id = _jit_asset_id(agent_id, destination_url)
+
+        await self._execute(
+            "MERGE (:Agent {agent_id: $agent_id})",
+            {"agent_id": agent_id},
+        )
+        await self._execute(
+            """
+            MERGE (e:Endpoint {url: $url})
+            ON CREATE SET e.endpoint_id = $endpoint_id, e.vpc_internal = false, e.jit_registered = true
+            """,
+            {"url": destination_url, "endpoint_id": endpoint_id},
+        )
+        await self._execute(
+            """
+            MERGE (d:DataAsset {asset_id: $asset_id})
+            ON CREATE SET d.classification = $classification, d.tags = $tags, d.jit_registered = true
+            """,
+            {"asset_id": asset_id, "classification": classification, "tags": regulations},
+        )
+        await self._execute(
+            """
+            MATCH (a:Agent {agent_id: $agent_id}), (d:DataAsset {asset_id: $asset_id}),
+                  (e:Endpoint {url: $url})
+            MERGE (a)-[:ACCESSES]->(d)
+            MERGE (d)-[:STORED_AT]->(e)
+            MERGE (a)-[:AUTHORIZED_FOR]->(e)
+            """,
+            {"agent_id": agent_id, "asset_id": asset_id, "url": destination_url},
+        )
+        for reg in regulations:
+            reg_id = f"reg_{reg.lower()}"
+            await self._execute(
+                """
+                MERGE (r:Regulation {name: $name})
+                ON CREATE SET r.reg_id = $reg_id
+                """,
+                {"name": reg, "reg_id": reg_id},
+            )
+            await self._execute(
+                """
+                MATCH (d:DataAsset {asset_id: $asset_id}), (r:Regulation {name: $name})
+                MERGE (d)-[:GOVERNED_BY]->(r)
+                """,
+                {"asset_id": asset_id, "name": reg},
+            )
+
+        # Return the stable endpoint_id (may differ from stored if endpoint pre-existed)
+        rows = await self._execute(
+            "MATCH (e:Endpoint {url: $url}) RETURN e.endpoint_id AS endpoint_id",
+            {"url": destination_url},
+        )
+        return rows[0]["endpoint_id"]
+
 
 class MockRiskGraph(RiskGraph):
     """In-memory stub for testing — no Memgraph required."""
@@ -416,3 +624,44 @@ class MockRiskGraph(RiskGraph):
 
     async def agent_exists(self, agent_id: str) -> bool:
         return agent_id in self._agents
+
+    async def upsert_jit_path(
+        self,
+        agent_id: str,
+        destination_url: str,
+        classification: str,
+        regulations: list[str],
+    ) -> str:
+        """JIT-register an agent→endpoint path in the in-memory store. Idempotent."""
+        endpoint_id = _jit_endpoint_id(destination_url)
+        asset_id = _jit_asset_id(agent_id, destination_url)
+
+        self._agents.setdefault(agent_id, {"agent_id": agent_id})
+        self._endpoints.setdefault(endpoint_id, {
+            "endpoint_id": endpoint_id,
+            "url": destination_url,
+            "vpc_internal": False,
+            "jit_registered": True,
+        })
+        self._assets.setdefault(asset_id, {
+            "asset_id": asset_id,
+            "classification": classification,
+            "tags": regulations,
+            "jit_registered": True,
+        })
+        for reg in regulations:
+            reg_id = f"reg_{reg.lower()}"
+            self._regulations.setdefault(reg_id, {"reg_id": reg_id, "name": reg})
+            edge = (asset_id, "GOVERNED_BY", reg_id)
+            if edge not in self._edges:
+                self._edges.append(edge)
+
+        for frm, rel, to in [
+            (agent_id, "ACCESSES", asset_id),
+            (asset_id, "STORED_AT", endpoint_id),
+            (agent_id, "AUTHORIZED_FOR", endpoint_id),
+        ]:
+            if (frm, rel, to) not in self._edges:
+                self._edges.append((frm, rel, to))
+
+        return endpoint_id

@@ -56,3 +56,12 @@ class PathNotFoundError(CipherWeaveError):
         super().__init__(
             f"No path from agent '{agent_id}' to destination '{destination_url}'"
         )
+
+
+class MetadataInferenceError(CipherWeaveError):
+    """Cannot infer encryption policy — metadata is missing, invalid, or unrecognized."""
+
+    def __init__(self, field: str, reason: str) -> None:
+        self.field = field
+        self.reason = reason
+        super().__init__(f"Cannot infer policy from metadata — {field}: {reason}")

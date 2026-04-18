@@ -17,12 +17,13 @@ from cipherweave.config import settings
 from cipherweave.drift_detector import DriftDetector
 from cipherweave.exceptions import (
     CipherWeaveError,
+    MetadataInferenceError,  # noqa: F401 — re-exported so FastMCP surfaces it as tool error
     PathNotFoundError,
     UnauthorizedAgentError,
 )
 from cipherweave.models import EncryptionStrategy
 from cipherweave.profiles import CipherProfile
-from cipherweave.risk_engine import RiskGraph
+from cipherweave.risk_engine import RiskGraph, infer_policy_from_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ mcp = fastmcp.FastMCP("CipherWeave")
 _risk_graph: RiskGraph | None = None
 _cipher_janitor: CipherJanitor | None = None
 _drift_detector: DriftDetector | None = None
+_bedrock_client: object | None = None  # boto3 bedrock-runtime client; None in local dev
 
 
 def _build_info_string(
@@ -73,10 +75,22 @@ async def get_encryption_strategy(
     decision_id = _make_decision_id()
     data_tags: list[str] = data_metadata.get("tags", [])
 
-    # Step 1: Validate agent exists and is authorized for destination endpoint
+    # Step 1: Resolve endpoint; JIT-register if unknown
     endpoint_id = await _risk_graph.get_endpoint_id_for_url(destination_url)
     if endpoint_id is None:
-        raise PathNotFoundError(agent_id, destination_url)
+        # Strict metadata validation then Bedrock inference — raises MetadataInferenceError on failure
+        classification, regulations, _, _, _ = await infer_policy_from_metadata(
+            data_metadata,
+            bedrock_client=_bedrock_client,
+            model_id=settings.bedrock_inference_model_id,
+        )
+        endpoint_id = await _risk_graph.upsert_jit_path(
+            agent_id, destination_url, classification, regulations
+        )
+        logger.info(
+            "JIT registered: agent=%s url=%s classification=%s regs=%s",
+            agent_id, destination_url, classification, regulations,
+        )
 
     try:
         await _risk_graph.validate_agent_authorization(agent_id, endpoint_id)
@@ -177,7 +191,7 @@ async def get_encryption_strategy(
 
 async def _init_components() -> None:
     """Initialize all module singletons."""
-    global _risk_graph, _cipher_janitor, _drift_detector
+    global _risk_graph, _cipher_janitor, _drift_detector, _bedrock_client
 
     # Risk graph
     _risk_graph = RiskGraph(
@@ -187,12 +201,13 @@ async def _init_components() -> None:
     await _risk_graph.connect()
     await _risk_graph.initialize_schema()
 
-    # KMS client
+    # AWS clients (production only)
     kms_client = None
     if not settings.use_local_kms and settings.kms_key_id:
         import boto3
-
         kms_client = boto3.client("kms", region_name=settings.aws_region)
+        _bedrock_client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+        logger.info("Bedrock policy inference enabled (model=%s)", settings.bedrock_inference_model_id)
 
     _cipher_janitor = CipherJanitor(
         kms_client=kms_client,
@@ -209,12 +224,14 @@ def inject_components(
     risk_graph: RiskGraph,
     cipher_janitor: CipherJanitor,
     drift_detector: DriftDetector,
+    bedrock_client: object | None = None,
 ) -> None:
-    """Inject pre-built components (used in tests)."""
-    global _risk_graph, _cipher_janitor, _drift_detector
+    """Inject pre-built components (used in Lambda handler and tests)."""
+    global _risk_graph, _cipher_janitor, _drift_detector, _bedrock_client
     _risk_graph = risk_graph
     _cipher_janitor = cipher_janitor
     _drift_detector = drift_detector
+    _bedrock_client = bedrock_client
 
 
 async def main() -> None:

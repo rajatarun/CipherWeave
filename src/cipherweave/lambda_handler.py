@@ -52,22 +52,37 @@ _initialized = False
 
 
 async def _async_init() -> None:
-    risk_graph = RiskGraph(
-        memgraph_host=settings.memgraph_host,
-        memgraph_port=settings.memgraph_port,
-    )
-    await risk_graph.connect()
-    await risk_graph.initialize_schema()
+    from cipherweave.risk_engine import MockRiskGraph
+
+    risk_graph: RiskGraph
+    try:
+        risk_graph = RiskGraph(
+            memgraph_host=settings.memgraph_host,
+            memgraph_port=settings.memgraph_port,
+        )
+        await risk_graph.connect()
+        await risk_graph.initialize_schema()
+        logger.info("Connected to Memgraph at %s:%s", settings.memgraph_host, settings.memgraph_port)
+    except Exception as exc:
+        logger.warning(
+            "Memgraph unavailable (%s:%s — %s); falling back to MockRiskGraph",
+            settings.memgraph_host, settings.memgraph_port, exc,
+        )
+        risk_graph = MockRiskGraph()
 
     kms_client = None
+    bedrock_client = None
     if not settings.use_local_kms and settings.kms_key_id:
         import boto3
         kms_client = boto3.client("kms", region_name=settings.aws_region)
+        bedrock_client = boto3.client("bedrock-runtime", region_name=settings.aws_region)
+        logger.info("Bedrock policy inference enabled (model=%s)", settings.bedrock_inference_model_id)
 
     inject_components(
         risk_graph,
         CipherJanitor(kms_client=kms_client, master_key_id=settings.kms_key_id),
         DriftDetector(window_size=settings.drift_window_size),
+        bedrock_client=bedrock_client,
     )
     logger.info(
         "CipherWeave initialized — Memgraph=%s:%s",
