@@ -35,14 +35,14 @@ Parameters:
       KMS key ARN for master secret derivation.
       Sourced from contextweave-rag-prod KMSKeyArn output at deploy time.
 
-  # VPC networking — fetched from EC2 instance metadata in the deploy workflow
+  # VPC networking — fetched from shared networking stack in the deploy workflow
   VpcId:
     Type: AWS::EC2::VPC::Id
-    Description: VPC containing the Memgraph instance
+    Description: VPC ID derived from shared Lambda subnet in shared networking stack
 
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
-    Description: Subnets (same VPC as Memgraph) for Lambda ENIs
+    Description: Shared private Lambda subnets for ENIs (comma-delimited list from workflow)
 
   MemgraphSecurityGroupId:
     Type: String

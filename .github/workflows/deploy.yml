@@ -33,7 +33,8 @@ env:
   AWS_REGION: us-east-1
   STAGE: ${{ github.event.inputs.stage || 'prod' }}
   STACK_NAME: cipherweave-${{ github.event.inputs.stage || 'prod' }}
-  SOURCE_STACK: contextweave-rag-prod   # Stack whose outputs we read at runtime
+  SOURCE_STACK: contextweave-rag-prod     # CipherWeave dependency stack (Memgraph/KMS/artifacts)
+  SHARED_STACK: tarun-teamweave-shared    # Shared networking stack (Lambda subnets)
 
 jobs:
   # ── Build & Deploy ──────────────────────────────────────────────────────
@@ -99,25 +100,59 @@ jobs:
           echo "✅ KMSKeyArn:        ${KMS_KEY_ARN:0:50}..."
           echo "✅ ArtifactBucket:   ${ARTIFACT_BUCKET:-'(not found — will use --resolve-s3)'}"
 
-      # ── 4. Resolve VPC/Subnet/SG from the Memgraph EC2 instance ─────────
-      # Uses the instance ID fetched from CFN — not hardcoded.
-      - name: Resolve VPC parameters from Memgraph EC2 instance
+      # ── 4. Resolve VPC/subnets from shared stack + SG from Memgraph EC2 ─
+      # Shared stack exports Lambda subnet IDs; VPC is derived from subnet.
+      - name: Resolve VPC parameters from shared stack and Memgraph EC2
         id: vpc
         run: |
+          SHARED_OUTPUTS=$(aws cloudformation describe-stacks \
+            --stack-name "$SHARED_STACK" \
+            --query "Stacks[0].Outputs" \
+            --output json)
+
+          get_shared() { echo "$SHARED_OUTPUTS" | jq -r --arg k "$1" '.[] | select(.OutputKey==$k) | .OutputValue'; }
+
+          SUBNET_AZ1=$(get_shared LambdaSubnetAz1Id)
+          SUBNET_AZ2=$(get_shared LambdaSubnetAz2Id)
+
+          for VAR_NAME in SUBNET_AZ1 SUBNET_AZ2; do
+            VAL="${!VAR_NAME}"
+            if [ -z "$VAL" ] || [ "$VAL" = "null" ]; then
+              echo "❌ $VAR_NAME is empty in $SHARED_STACK outputs"
+              exit 1
+            fi
+          done
+
+          VPC_ID=$(aws ec2 describe-subnets \
+            --subnet-ids "$SUBNET_AZ1" \
+            --query "Subnets[0].VpcId" \
+            --output text)
+
           INSTANCE_JSON=$(aws ec2 describe-instances \
             --instance-ids "${{ steps.source_stack.outputs.memgraph_instance_id }}" \
             --query 'Reservations[0].Instances[0]' \
             --output json)
 
-          VPC_ID=$(echo "$INSTANCE_JSON"    | jq -r '.VpcId')
-          SUBNET_ID=$(echo "$INSTANCE_JSON" | jq -r '.SubnetId')
           MEMGRAPH_SG=$(echo "$INSTANCE_JSON" | jq -r '.SecurityGroups[0].GroupId')
 
-          echo "vpc_id=$VPC_ID"         >> "$GITHUB_OUTPUT"
-          echo "subnet_id=$SUBNET_ID"   >> "$GITHUB_OUTPUT"
-          echo "memgraph_sg=$MEMGRAPH_SG" >> "$GITHUB_OUTPUT"
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ] || [ "$VPC_ID" = "null" ]; then
+            echo "❌ Failed to derive VPC ID from shared subnet $SUBNET_AZ1"
+            exit 1
+          fi
+          if [ -z "$MEMGRAPH_SG" ] || [ "$MEMGRAPH_SG" = "null" ]; then
+            echo "❌ Failed to resolve Memgraph security group"
+            exit 1
+          fi
 
-          echo "✅ VPC=$VPC_ID  Subnet=$SUBNET_ID  MemgraphSG=$MEMGRAPH_SG"
+          SUBNET_IDS="$SUBNET_AZ1,$SUBNET_AZ2"
+
+          echo "vpc_id=$VPC_ID"            >> "$GITHUB_OUTPUT"
+          echo "subnet_ids=$SUBNET_IDS"    >> "$GITHUB_OUTPUT"
+          echo "memgraph_sg=$MEMGRAPH_SG"  >> "$GITHUB_OUTPUT"
+
+          echo "✅ Shared subnets: $SUBNET_IDS"
+          echo "✅ Derived VPC: $VPC_ID"
+          echo "✅ Memgraph SG: $MEMGRAPH_SG"
 
       # ── 5. Python + SAM CLI ──────────────────────────────────────────────
       - name: Set up Python 3.12
@@ -162,7 +197,7 @@ jobs:
               "MemgraphPort=7687" \
               "KMSKeyArn=${{ steps.source_stack.outputs.kms_key_arn }}" \
               "VpcId=${{ steps.vpc.outputs.vpc_id }}" \
-              "SubnetIds=${{ steps.vpc.outputs.subnet_id }}" \
+              "SubnetIds=${{ steps.vpc.outputs.subnet_ids }}" \
               "MemgraphSecurityGroupId=${{ steps.vpc.outputs.memgraph_sg }}" \
               "UseLocalKMS=false" \
               "LogLevel=INFO"
@@ -198,8 +233,10 @@ jobs:
           echo "| API Endpoint | \`${{ steps.cw_outputs.outputs.api_endpoint }}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Memgraph | \`${{ steps.source_stack.outputs.memgraph_host }}:7687\` (instance \`${{ steps.source_stack.outputs.memgraph_instance_id }}\`) |" >> "$GITHUB_STEP_SUMMARY"
           echo "| VPC | \`${{ steps.vpc.outputs.vpc_id }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Lambda Subnets | \`${{ steps.vpc.outputs.subnet_ids }}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| KMS Key | \`...${KMS: -12}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Source Stack | \`$SOURCE_STACK\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Shared Network Stack | \`$SHARED_STACK\` |" >> "$GITHUB_STEP_SUMMARY"
 
   # ── Seed Memgraph Graph ─────────────────────────────────────────────────
   seed-graph:
