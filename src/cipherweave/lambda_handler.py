@@ -35,6 +35,14 @@ from cipherweave.risk_engine import RiskGraph
 from cipherweave.server import inject_components, mcp
 
 # ---------------------------------------------------------------------------
+# Persistent event loop — created once, reused by both _ensure_init and Mangum.
+# asyncio.run() destroys the loop after use; Mangum's get_event_loop() then
+# raises RuntimeError on Python 3.12. A module-level loop avoids this.
+# ---------------------------------------------------------------------------
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
+
+# ---------------------------------------------------------------------------
 # Deferred initialization state
 # ---------------------------------------------------------------------------
 _initialized = False
@@ -72,7 +80,7 @@ def _ensure_init() -> None:
     if _initialized:
         return
     try:
-        asyncio.run(_async_init())
+        _loop.run_until_complete(_async_init())
         _initialized = True
         _init_error = None
     except Exception as exc:
