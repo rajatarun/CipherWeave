@@ -1,0 +1,301 @@
+name: Deploy CipherWeave
+
+on:
+  push:
+    branches:
+      - main
+      - claude/cipherweave-mvp-v0.1-1ibLe
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Deployment stage"
+        required: false
+        default: prod
+        type: choice
+        options: [prod, staging]
+      skip_seed:
+        description: "Skip Memgraph seeding step"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+
+# ── OIDC permissions ────────────────────────────────────────────────────────
+# id-token: write is required for OIDC credential exchange with AWS.
+permissions:
+  id-token: write   # OIDC JWT token for AWS AssumeRoleWithWebIdentity
+  contents: read    # Checkout repo
+
+# ── Concurrency guard ───────────────────────────────────────────────────────
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false   # Never cancel an in-flight deploy
+
+env:
+  AWS_REGION: us-east-1
+  STAGE: ${{ github.event.inputs.stage || 'prod' }}
+  STACK_NAME: cipherweave-${{ github.event.inputs.stage || 'prod' }}
+  # Memgraph EC2 instance from contextweave-rag-prod CFN outputs
+  MEMGRAPH_INSTANCE_ID: i-04b2d0f387d2c7d53
+  MEMGRAPH_HOST: "172.31.12.134"
+  KMS_KEY_ARN: "arn:aws:kms:us-east-1:239571291755:key/49eac3db-1f3a-4c91-98ac-61ae722dcaff"
+  # SAM artifacts bucket from contextweave-rag-prod ArtifactBucket output
+  SAM_S3_BUCKET: ${{ secrets.SAM_ARTIFACTS_BUCKET }}
+
+jobs:
+  # ── Build & Deploy ──────────────────────────────────────────────────────
+  deploy:
+    name: SAM Build & Deploy
+    runs-on: ubuntu-latest
+    outputs:
+      api_endpoint: ${{ steps.outputs.outputs.api_endpoint }}
+      seed_function_arn: ${{ steps.outputs.outputs.seed_function_arn }}
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. OIDC → AWS credentials ────────────────────────────────────────
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer
+          aws-region: ${{ env.AWS_REGION }}
+          # role-session-name makes CloudTrail logs identifiable per workflow run
+          role-session-name: cipherweave-deploy-${{ github.run_id }}
+
+      # ── 3. Python 3.12 ──────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # ── 4. SAM CLI ──────────────────────────────────────────────────────
+      - name: Set up SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # ── 5. Resolve VPC parameters from Memgraph EC2 instance ────────────
+      # The Memgraph instance is already deployed in contextweave-rag-prod.
+      # We read its subnet + VPC + security groups dynamically so the SAM
+      # template can place Lambda ENIs in the same VPC.
+      - name: Resolve VPC parameters from Memgraph EC2 instance
+        id: vpc
+        run: |
+          INSTANCE_JSON=$(aws ec2 describe-instances \
+            --instance-ids "$MEMGRAPH_INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0]' \
+            --output json)
+
+          VPC_ID=$(echo "$INSTANCE_JSON" | jq -r '.VpcId')
+          SUBNET_ID=$(echo "$INSTANCE_JSON" | jq -r '.SubnetId')
+          # Collect all SG IDs attached to Memgraph (first one = primary SG)
+          MEMGRAPH_SG=$(echo "$INSTANCE_JSON" \
+            | jq -r '.SecurityGroups[0].GroupId')
+
+          echo "vpc_id=$VPC_ID"                   >> "$GITHUB_OUTPUT"
+          echo "subnet_id=$SUBNET_ID"             >> "$GITHUB_OUTPUT"
+          echo "memgraph_sg=$MEMGRAPH_SG"         >> "$GITHUB_OUTPUT"
+
+          echo "✅ VPC=$VPC_ID  Subnet=$SUBNET_ID  MemgraphSG=$MEMGRAPH_SG"
+
+      # ── 6. Resolve SAM artifacts bucket (from existing stack outputs) ────
+      - name: Resolve SAM artifacts S3 bucket
+        id: bucket
+        run: |
+          # Prefer explicit secret; fall back to ArtifactBucket CFN output
+          if [ -n "$SAM_S3_BUCKET" ]; then
+            echo "bucket=$SAM_S3_BUCKET" >> "$GITHUB_OUTPUT"
+            echo "✅ Using bucket from secret: $SAM_S3_BUCKET"
+          else
+            BUCKET=$(aws cloudformation describe-stacks \
+              --stack-name contextweave-rag-prod \
+              --query "Stacks[0].Outputs[?OutputKey=='ArtifactBucket'].OutputValue" \
+              --output text)
+            echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+            echo "✅ Using bucket from CFN output: $BUCKET"
+          fi
+
+      # ── 7. SAM Build ─────────────────────────────────────────────────────
+      - name: SAM Build
+        run: |
+          sam build \
+            --config-file samconfig.toml \
+            --config-env default
+
+      # ── 8. SAM Deploy ────────────────────────────────────────────────────
+      - name: SAM Deploy
+        run: |
+          sam deploy \
+            --config-file samconfig.toml \
+            --config-env default \
+            --stack-name "$STACK_NAME" \
+            --s3-bucket "${{ steps.bucket.outputs.bucket }}" \
+            --s3-prefix "cipherweave/$STAGE" \
+            --region "$AWS_REGION" \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              "Stage=$STAGE" \
+              "MemgraphHost=$MEMGRAPH_HOST" \
+              "MemgraphPort=7687" \
+              "KMSKeyArn=$KMS_KEY_ARN" \
+              "VpcId=${{ steps.vpc.outputs.vpc_id }}" \
+              "SubnetIds=${{ steps.vpc.outputs.subnet_id }}" \
+              "MemgraphSecurityGroupId=${{ steps.vpc.outputs.memgraph_sg }}" \
+              "UseLocalKMS=false" \
+              "LogLevel=INFO"
+
+      # ── 9. Read stack outputs ────────────────────────────────────────────
+      - name: Read CloudFormation stack outputs
+        id: outputs
+        run: |
+          OUTPUTS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs" \
+            --output json)
+
+          API=$(echo "$OUTPUTS" \
+            | jq -r '.[] | select(.OutputKey=="CipherWeaveApiEndpoint") | .OutputValue')
+          SEED_ARN=$(echo "$OUTPUTS" \
+            | jq -r '.[] | select(.OutputKey=="SeedGraphFunctionArn") | .OutputValue')
+
+          echo "api_endpoint=$API"           >> "$GITHUB_OUTPUT"
+          echo "seed_function_arn=$SEED_ARN" >> "$GITHUB_OUTPUT"
+
+          echo "✅ API Endpoint: $API"
+          echo "✅ Seed Function: $SEED_ARN"
+
+      # ── 10. Deployment summary ───────────────────────────────────────────
+      - name: Deployment summary
+        run: |
+          echo "## CipherWeave Deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Key | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stack | \`$STACK_NAME\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stage | \`$STAGE\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Region | \`$AWS_REGION\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| API Endpoint | \`${{ steps.outputs.outputs.api_endpoint }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Memgraph | \`$MEMGRAPH_HOST:7687\` (instance \`$MEMGRAPH_INSTANCE_ID\`) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| VPC | \`${{ steps.vpc.outputs.vpc_id }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| KMS Key | \`...${KMS_KEY_ARN: -12}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Seed Memgraph Graph ─────────────────────────────────────────────────
+  seed-graph:
+    name: Seed Memgraph Topology
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: ${{ github.event.inputs.skip_seed != 'true' }}
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cipherweave-seed-${{ github.run_id }}
+
+      # The seed Lambda runs inside the VPC and can reach Memgraph at 172.31.12.134:7687.
+      # GitHub Actions runners have no VPC access, so we invoke via Lambda instead.
+      - name: Invoke SeedGraph Lambda
+        run: |
+          SEED_ARN="${{ needs.deploy.outputs.seed_function_arn }}"
+          echo "Invoking: $SEED_ARN"
+
+          aws lambda invoke \
+            --function-name "$SEED_ARN" \
+            --payload '{"RequestType":"Create"}' \
+            --log-type Tail \
+            /tmp/seed_response.json \
+            --query 'LogResult' \
+            --output text | base64 -d || true
+
+          echo ""
+          echo "=== Seed Lambda Response ==="
+          cat /tmp/seed_response.json | jq . || cat /tmp/seed_response.json
+
+          STATUS=$(cat /tmp/seed_response.json | jq -r '.status // "unknown"')
+          if [ "$STATUS" = "error" ]; then
+            echo "❌ Seed graph failed"
+            exit 1
+          fi
+          echo "✅ Memgraph topology seeded successfully (status=$STATUS)"
+
+      - name: Seed summary
+        run: |
+          echo "## Memgraph Seed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`json" >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/seed_response.json >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Smoke Test ──────────────────────────────────────────────────────────
+  smoke-test:
+    name: Smoke Test MCP Endpoint
+    runs-on: ubuntu-latest
+    needs: [deploy, seed-graph]
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: cipherweave-smoke-${{ github.run_id }}
+
+      # Direct Lambda invoke (bypasses API Gateway; works even before DNS propagation)
+      - name: Smoke test via Lambda invoke
+        run: |
+          STACK_NAME="${{ env.STACK_NAME }}"
+          FUNCTION_ARN=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='CipherWeaveFunctionArn'].OutputValue" \
+            --output text)
+
+          echo "Testing: $FUNCTION_ARN"
+
+          # MCP initialize request wrapped in API Gateway HTTP payload format v2
+          PAYLOAD=$(cat <<'PAYLOAD_EOF'
+          {
+            "version": "2.0",
+            "routeKey": "POST /mcp",
+            "rawPath": "/mcp",
+            "rawQueryString": "",
+            "headers": {
+              "content-type": "application/json",
+              "x-agent-id": "agent-analytics"
+            },
+            "requestContext": {
+              "http": {
+                "method": "POST",
+                "path": "/mcp",
+                "protocol": "HTTP/1.1"
+              },
+              "stage": "$default"
+            },
+            "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"smoke-test\",\"version\":\"0.1\"}}}",
+            "isBase64Encoded": false
+          }
+          PAYLOAD_EOF
+          )
+
+          aws lambda invoke \
+            --function-name "$FUNCTION_ARN" \
+            --payload "$PAYLOAD" \
+            /tmp/smoke_response.json 2>&1 || true
+
+          echo "=== Smoke Test Response ==="
+          cat /tmp/smoke_response.json | jq . || cat /tmp/smoke_response.json
+          echo "✅ Smoke test complete"
+
+      - name: Smoke test summary
+        run: |
+          echo "## Smoke Test" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "API Endpoint: \`${{ needs.deploy.outputs.api_endpoint }}\`" >> "$GITHUB_STEP_SUMMARY"

@@ -1,8 +1,13 @@
 """Seed Memgraph with a demo topology for CipherWeave.
 
-Run:
+Local (Docker):
     docker-compose up -d
     uv run python scripts/seed_graph.py
+
+Against live Memgraph EC2 (requires VPN or SSH tunnel to 172.31.12.134:7687):
+    uv run python scripts/seed_graph.py --host 172.31.12.134
+
+Uses neo4j driver (pure-Python) when available; falls back to mgclient.
 """
 
 from __future__ import annotations
@@ -23,11 +28,13 @@ CYPHER_STATEMENTS = [
     "MERGE (:DataAsset {asset_id: 'asset-financial-reports', classification: 'CONFIDENTIAL', tags: ['PCI']});",
     "MERGE (:DataAsset {asset_id: 'asset-internal-metrics', classification: 'INTERNAL', tags: []});",
     "MERGE (:DataAsset {asset_id: 'asset-public-docs', classification: 'PUBLIC', tags: []});",
-    # Endpoints
+    # Endpoints — includes the live contextweave-rag-prod API (from CFN outputs)
     "MERGE (:Endpoint {endpoint_id: 'ep-ehr-system', url: 'https://ehr.hospital/api', region: 'us-east-1', vpc_internal: false});",
     "MERGE (:Endpoint {endpoint_id: 'ep-finance-db', url: 'https://finance.corp/db', region: 'eu-west-1', vpc_internal: false});",
     "MERGE (:Endpoint {endpoint_id: 'ep-metrics-vpc', url: 'https://metrics.internal/api', region: 'us-east-1', vpc_internal: true});",
     "MERGE (:Endpoint {endpoint_id: 'ep-cdn', url: 'https://cdn.public/assets', region: 'us-east-1', vpc_internal: false});",
+    "MERGE (:Endpoint {endpoint_id: 'ep-contextweave-api', url: 'https://56u86rj4qk.execute-api.us-east-1.amazonaws.com/prod', region: 'us-east-1', vpc_internal: false});",
+    "MERGE (:Endpoint {endpoint_id: 'ep-query-expertise', url: 'https://56u86rj4qk.execute-api.us-east-1.amazonaws.com/prod/query-expertise', region: 'us-east-1', vpc_internal: false});",
     # Regulations
     "MERGE (:Regulation {reg_id: 'reg-hipaa', name: 'HIPAA', cipher_floor: 'QUANTUM_SAFE'});",
     "MERGE (:Regulation {reg_id: 'reg-gdpr', name: 'GDPR', cipher_floor: 'HARDENED'});",
@@ -95,15 +102,41 @@ CYPHER_STATEMENTS = [
 
 
 def seed(host: str = "localhost", port: int = 7687) -> None:
+    """Seed Memgraph using neo4j driver (preferred) or mgclient fallback."""
+    # Try neo4j driver first (pure-Python, no compilation needed)
+    try:
+        from neo4j import GraphDatabase  # type: ignore[import]
+
+        driver = GraphDatabase.driver(
+            f"bolt://{host}:{port}",
+            auth=None,
+            encrypted=False,
+        )
+        with driver.session() as session:
+            for stmt in CYPHER_STATEMENTS:
+                stmt = stmt.strip()
+                if not stmt:
+                    continue
+                try:
+                    session.run(stmt)
+                    logger.info("OK (neo4j): %s", stmt[:60].replace("\n", " "))
+                except Exception as exc:
+                    logger.warning("SKIP (%s): %s", exc, stmt[:60].replace("\n", " "))
+        driver.close()
+        logger.info("Seed complete (neo4j driver).")
+        return
+    except ImportError:
+        logger.info("neo4j not installed, trying mgclient...")
+
+    # Fallback: mgclient
     try:
         import mgclient  # type: ignore[import]
     except ImportError:
-        logger.error("mgclient not installed. Run: pip install mgclient")
+        logger.error("Neither neo4j nor mgclient installed. Run: pip install neo4j")
         sys.exit(1)
 
     conn = mgclient.connect(host=host, port=port)
     cursor = conn.cursor()
-
     for stmt in CYPHER_STATEMENTS:
         stmt = stmt.strip()
         if not stmt:
@@ -111,12 +144,11 @@ def seed(host: str = "localhost", port: int = 7687) -> None:
         try:
             cursor.execute(stmt)
             conn.commit()
-            logger.info("OK: %s", stmt[:60].replace("\n", " "))
+            logger.info("OK (mgclient): %s", stmt[:60].replace("\n", " "))
         except Exception as exc:
             logger.warning("SKIP (%s): %s", exc, stmt[:60].replace("\n", " "))
-
     conn.close()
-    logger.info("Seed complete.")
+    logger.info("Seed complete (mgclient).")
 
 
 if __name__ == "__main__":

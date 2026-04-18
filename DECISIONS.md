@@ -123,3 +123,52 @@ This document records deliberate design choices, trade-offs, and assumptions mad
 4. Pre-computed risk score cache with TTL (invalidated on graph mutations)
 
 The benchmark suite tests against `MockRiskGraph` to validate the non-graph overhead is < 10ms, serving as the upper bound for optimization targets.
+
+---
+
+## ADR-013: SAM + GitHub Actions OIDC Deployment
+
+**Decision**: Deploy via AWS SAM with GitHub Actions using OIDC (no long-lived AWS credentials stored as secrets).
+
+**OIDC trust policy required on `arn:aws:iam::239571291755:role/teamweave-github-actions-sam-deployer`**:
+```json
+{
+  "Effect": "Allow",
+  "Principal": {"Federated": "arn:aws:iam::239571291755:oidc-provider/token.actions.githubusercontent.com"},
+  "Action": "sts:AssumeRoleWithWebIdentity",
+  "Condition": {
+    "StringEquals": {"token.actions.githubusercontent.com:aud": "sts.amazonaws.com"},
+    "StringLike":   {"token.actions.githubusercontent.com:sub": "repo:rajatarun/CipherWeave:*"}
+  }
+}
+```
+
+**Deployment flow**:
+1. OIDC exchange → short-lived credentials (no stored secrets)
+2. EC2 `describe-instances` on `i-04b2d0f387d2c7d53` → resolves VPC, Subnet, Security Group
+3. `sam build` → `sam deploy` with VPC params injected
+4. `SeedGraphOnDeploy` CloudFormation Custom Resource runs `SeedGraphFunction` in-VPC
+5. `SeedGraphFunction` (inside Lambda SG) opens Bolt to Memgraph `172.31.12.134:7687`
+6. Smoke test via direct Lambda invoke
+
+**Trade-off**: The seed step runs in-VPC via Lambda, not from the GitHub runner, because Memgraph is on a private IP (`172.31.12.134`). This is correct but means seed failures must be debugged via CloudWatch, not runner logs.
+
+---
+
+## ADR-014: neo4j Python Driver vs. mgclient for Lambda
+
+**Decision**: Use the `neo4j` (pure-Python) Bolt driver as the primary driver in Lambda. `mgclient` (C extension, requires compilation) remains optional for local dev.
+
+**Rationale**: SAM `sam build` without `--use-container` cannot compile C extensions. The `neo4j` driver is pip-installable with no native compilation and fully supports Memgraph's Bolt protocol.
+
+**Trade-off**: `neo4j` driver has ~2ms more connection overhead than `mgclient`. Acceptable for Lambda cold starts; connection is reused across warm invocations.
+
+---
+
+## ADR-015: Memgraph Topology Includes Real contextweave-rag-prod Endpoints
+
+**Decision**: The seed graph includes `ep-contextweave-api` and `ep-query-expertise` nodes pointing to `https://56u86rj4qk.execute-api.us-east-1.amazonaws.com/prod*`, which are the real API Gateway endpoints from the existing stack.
+
+**Rationale**: CipherWeave policy decisions should cover the endpoints that agents actually call. Seeding real endpoints means agents sending data to `contextweave-rag-prod` will immediately get policy decisions without manual graph construction.
+
+**Security implication**: The `ep-contextweave-api` endpoint is not VPC-internal, so agents accessing it will get `BALANCED` or higher profiles depending on the data classification. TRADE_SECRET assets mapped to this endpoint will trigger `QUANTUM_SAFE`.
