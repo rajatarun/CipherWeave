@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  CipherWeave v0.1 — Agentic Cryptography Intelligence Layer.
+  Deploys alongside the contextweave-rag-prod stack, reusing its
+  Memgraph EC2 instance, KMS key, and VPC networking.
+
+# ---------------------------------------------------------------------------
+# Parameters — all have sensible defaults from the contextweave-rag-prod
+# CloudFormation outputs visible in the deployment screenshot.
+# ---------------------------------------------------------------------------
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, staging, dev]
+
+  MemgraphHost:
+    Type: String
+    Default: "172.31.12.134"
+    Description: Private IP of the Memgraph EC2 instance (MemgraphPrivateIP output)
+
+  MemgraphPort:
+    Type: String
+    Default: "7687"
+
+  KMSKeyArn:
+    Type: String
+    Default: "arn:aws:kms:us-east-1:239571291755:key/49eac3db-1f3a-4c91-98ac-61ae722dcaff"
+    Description: KMS key ARN for master secret derivation (KMSKeyArn output)
+
+  # VPC networking — fetched from EC2 instance metadata in the deploy workflow
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC containing the Memgraph instance
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets (same VPC as Memgraph) for Lambda ENIs
+
+  MemgraphSecurityGroupId:
+    Type: String
+    Description: Security group attached to the Memgraph EC2 instance
+
+  UseLocalKMS:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: "true = os.urandom mock (dev only)"
+
+  DriftWindowSize:
+    Type: Number
+    Default: 100
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    Timeout: 29           # API Gateway max is 29s; keeps headroom for cold starts
+    MemorySize: 512
+    Layers:
+      - !Ref CipherWeaveDepLayer
+    Environment:
+      Variables:
+        CIPHERWEAVE_MEMGRAPH_HOST: !Ref MemgraphHost
+        CIPHERWEAVE_MEMGRAPH_PORT: !Ref MemgraphPort
+        CIPHERWEAVE_KMS_KEY_ID: !Ref KMSKeyArn
+        CIPHERWEAVE_USE_LOCAL_KMS: !Ref UseLocalKMS
+        CIPHERWEAVE_AWS_REGION: !Ref AWS::Region
+        CIPHERWEAVE_DRIFT_WINDOW_SIZE: !Ref DriftWindowSize
+        CIPHERWEAVE_LOG_LEVEL: !Ref LogLevel
+        POWERTOOLS_SERVICE_NAME: cipherweave
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ── Dependency Layer ──────────────────────────────────────────────────────
+  # Packages (fastmcp, neo4j, cryptography, mangum, …) built separately so
+  # the main function package stays small for fast cold starts.
+  CipherWeaveDepLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub cipherweave-deps-${Stage}
+      Description: CipherWeave Python dependencies
+      ContentUri: .
+      CompatibleRuntimes: [python3.12]
+      RetentionPolicy: Retain
+    Metadata:
+      BuildMethod: python3.12
+      BuildProperties:
+        # pip install into python/lib/python3.12/site-packages
+        ArtifactName: dependencies
+
+  # ── Security Group for Lambda ENIs ───────────────────────────────────────
+  CipherWeaveLambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub CipherWeave Lambda SG (${Stage})
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        # Bolt to Memgraph
+        - IpProtocol: tcp
+          FromPort: 7687
+          ToPort: 7687
+          CidrIp: 172.31.0.0/16
+        # HTTPS for KMS / Secrets Manager VPC endpoints (or internet)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Stack
+          Value: !Sub ${AWS::StackName}
+
+  # Allow Lambda SG → Memgraph SG on port 7687
+  MemgraphIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MemgraphSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 7687
+      ToPort: 7687
+      SourceSecurityGroupId: !Ref CipherWeaveLambdaSG
+      Description: CipherWeave Lambda to Memgraph Bolt
+
+  # ── IAM Role shared by all CipherWeave functions ─────────────────────────
+  CipherWeaveExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub cipherweave-lambda-role-${Stage}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: CipherWeaveKMS
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !Ref KMSKeyArn
+        - PolicyName: CipherWeaveLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cipherweave-*:*
+
+  # ── HTTP API Gateway ──────────────────────────────────────────────────────
+  CipherWeaveApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Name: !Sub cipherweave-api-${Stage}
+      StageName: !Ref Stage
+      Description: CipherWeave MCP tool endpoint (HTTP/SSE transport)
+      AccessLogSettings:
+        DestinationArn: !GetAtt CipherWeaveApiLogGroup.Arn
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 100
+
+  CipherWeaveApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/cipherweave-${Stage}
+      RetentionInDays: 14
+
+  # ── Main MCP Server Lambda ────────────────────────────────────────────────
+  CipherWeaveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub cipherweave-server-${Stage}
+      CodeUri: src/
+      Handler: cipherweave.lambda_handler.handler
+      Role: !GetAtt CipherWeaveExecutionRole.Arn
+      Description: CipherWeave get_encryption_strategy MCP tool (Mangum/ASGI)
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref CipherWeaveLambdaSG
+        SubnetIds: !Ref SubnetIds
+      Events:
+        McpProxy:
+          Type: HttpApi
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+            ApiId: !Ref CipherWeaveApi
+        McpRoot:
+          Type: HttpApi
+          Properties:
+            Path: /
+            Method: ANY
+            ApiId: !Ref CipherWeaveApi
+    Metadata:
+      BuildMethod: python3.12
+
+  CipherWeaveFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/cipherweave-server-${Stage}
+      RetentionInDays: 14
+
+  # ── Seed Graph Lambda ─────────────────────────────────────────────────────
+  # Invoked as a CloudFormation Custom Resource on every deploy to ensure
+  # the Memgraph topology is up-to-date. Also invocable manually.
+  SeedGraphFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub cipherweave-seed-graph-${Stage}
+      CodeUri: src/
+      Handler: cipherweave.seed_lambda.handler
+      Role: !GetAtt CipherWeaveExecutionRole.Arn
+      Description: Seeds Memgraph with CipherWeave demo topology (Custom Resource)
+      Timeout: 300          # Graph seeding may take a few seconds on cold start
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref CipherWeaveLambdaSG
+        SubnetIds: !Ref SubnetIds
+    Metadata:
+      BuildMethod: python3.12
+
+  SeedGraphFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/cipherweave-seed-graph-${Stage}
+      RetentionInDays: 7
+
+  # CloudFormation Custom Resource — triggers SeedGraphFunction on every deploy
+  SeedGraphOnDeploy:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - MemgraphIngressFromLambda
+      - SeedGraphFunctionLogGroup
+    Properties:
+      ServiceToken: !GetAtt SeedGraphFunction.Arn
+      # Changing this value forces re-execution on every stack update
+      DeployTimestamp: !Sub "${AWS::StackName}-${Stage}"
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  CipherWeaveApiEndpoint:
+    Description: HTTP API endpoint for MCP tool calls
+    Value: !Sub https://${CipherWeaveApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  CipherWeaveFunctionArn:
+    Description: ARN of the main MCP Lambda
+    Value: !GetAtt CipherWeaveFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-FunctionArn
+
+  SeedGraphFunctionArn:
+    Description: ARN of the seed graph Lambda (invoke manually to re-seed)
+    Value: !GetAtt SeedGraphFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-SeedFunctionArn
+
+  LambdaSecurityGroupId:
+    Description: Security group ID for CipherWeave Lambda ENIs
+    Value: !Ref CipherWeaveLambdaSG
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaSGId

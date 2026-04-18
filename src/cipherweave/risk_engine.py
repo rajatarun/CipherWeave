@@ -1,4 +1,10 @@
-"""Module 1: Topological Risk Engine — graph-based path risk scoring via Memgraph."""
+"""Module 1: Topological Risk Engine — graph-based path risk scoring via Memgraph.
+
+Driver strategy:
+  1. neo4j (pure-Python Bolt driver) — preferred in Lambda / production
+  2. mgclient (C extension) — fallback for local dev when neo4j not installed
+  3. MockRiskGraph — in-memory stub for unit tests
+"""
 
 from __future__ import annotations
 
@@ -10,6 +16,14 @@ from cipherweave.models import PathRiskResult
 from cipherweave.profiles import CipherProfile
 
 logger = logging.getLogger(__name__)
+
+# Detect available Bolt driver at import time
+try:
+    from neo4j import AsyncGraphDatabase as _Neo4jDriver  # type: ignore[import]
+    _BOLT_DRIVER = "neo4j"
+except ImportError:
+    _Neo4jDriver = None
+    _BOLT_DRIVER = "mgclient"
 
 # Data classification ordinal (higher = more sensitive)
 _CLASSIFICATION_RANK: dict[str, int] = {
@@ -90,38 +104,66 @@ def _profile_from_risk(
 
 
 class RiskGraph:
-    """Graph-based path risk scoring using Memgraph (Bolt/Cypher)."""
+    """Graph-based path risk scoring using Memgraph (Bolt/Cypher).
+
+    Uses the neo4j async driver (pure-Python, Lambda-safe) when available;
+    falls back to mgclient (C extension) for local dev.
+    """
 
     def __init__(self, memgraph_host: str = "localhost", memgraph_port: int = 7687) -> None:
         self._host = memgraph_host
         self._port = memgraph_port
-        self._conn: Any = None  # neo4j/mgclient driver connection
+        self._driver: Any = None
 
     async def connect(self) -> None:
         """Open a Bolt connection to Memgraph."""
         try:
-            import mgclient  # type: ignore[import]
-
-            self._conn = mgclient.connect(host=self._host, port=self._port)
-            logger.info("Connected to Memgraph at %s:%s", self._host, self._port)
+            if _BOLT_DRIVER == "neo4j" and _Neo4jDriver is not None:
+                self._driver = _Neo4jDriver.driver(
+                    f"bolt://{self._host}:{self._port}",
+                    auth=None,       # Memgraph default: no auth
+                    encrypted=False,
+                )
+                # Verify connectivity
+                async with self._driver.session() as session:
+                    await session.run("RETURN 1")
+                logger.info("Connected to Memgraph via neo4j driver at %s:%s", self._host, self._port)
+            else:
+                import mgclient  # type: ignore[import]
+                self._driver = mgclient.connect(host=self._host, port=self._port)
+                logger.info("Connected to Memgraph via mgclient at %s:%s", self._host, self._port)
         except Exception as exc:
             raise GraphConnectionError(
                 f"Cannot connect to Memgraph at {self._host}:{self._port}: {exc}"
             ) from exc
 
     async def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        if self._driver is not None:
+            try:
+                if _BOLT_DRIVER == "neo4j":
+                    await self._driver.close()
+                else:
+                    self._driver.close()
+            except Exception:
+                pass
+            self._driver = None
 
-    def _execute(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-        """Run a Cypher query and return rows as dicts."""
-        if self._conn is None:
+    async def _execute(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Run a Cypher query and return rows as dicts (async)."""
+        if self._driver is None:
             raise GraphConnectionError("Not connected to Memgraph. Call connect() first.")
-        cursor = self._conn.cursor()
-        cursor.execute(query, params or {})
-        cols = [desc[0] for desc in cursor.description] if cursor.description else []
-        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+        if _BOLT_DRIVER == "neo4j":
+            async with self._driver.session() as session:
+                result = await session.run(query, params or {})
+                records = await result.data()
+                return records  # neo4j driver returns list[dict] from .data()
+        else:
+            # mgclient synchronous path
+            cursor = self._driver.cursor()
+            cursor.execute(query, params or {})
+            cols = [desc[0] for desc in cursor.description] if cursor.description else []
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
     async def initialize_schema(self) -> None:
         """Create indexes and constraints."""
@@ -135,7 +177,7 @@ class RiskGraph:
         ]
         for stmt in ddl_statements:
             try:
-                self._execute(stmt)
+                await self._execute(stmt)
             except Exception:
                 # Indexes may already exist; non-fatal
                 pass
@@ -149,7 +191,7 @@ class RiskGraph:
     ) -> PathRiskResult:
         """Compute cipher profile and risk score for an agent→endpoint path."""
         # 1. Find matching endpoint
-        ep_rows = self._execute(
+        ep_rows = await self._execute(
             "MATCH (e:Endpoint {url: $url}) RETURN e.endpoint_id AS endpoint_id, e.vpc_internal AS vpc_internal",
             {"url": destination_url},
         )
@@ -159,7 +201,7 @@ class RiskGraph:
         vpc_internal = bool(ep_rows[0].get("vpc_internal", False))
 
         # 2. Find DataAssets accessed by this agent that are stored at this endpoint
-        asset_rows = self._execute(
+        asset_rows = await self._execute(
             """
             MATCH (a:Agent {agent_id: $agent_id})-[:ACCESSES]->(d:DataAsset)-[:STORED_AT]->(e:Endpoint {endpoint_id: $ep_id})
             RETURN d.asset_id AS asset_id, d.classification AS classification, d.tags AS tags
@@ -175,7 +217,7 @@ class RiskGraph:
             asset_id = asset_rows[0].get("asset_id")
 
         # 3. Find regulations governing data assets on this path
-        reg_rows = self._execute(
+        reg_rows = await self._execute(
             """
             MATCH (a:Agent {agent_id: $agent_id})-[:ACCESSES]->(d:DataAsset)-[:GOVERNED_BY]->(r:Regulation)
             WHERE EXISTS { (d)-[:STORED_AT]->(:Endpoint {endpoint_id: $ep_id}) }
@@ -185,8 +227,8 @@ class RiskGraph:
         )
         regulations = [row["reg_name"] for row in reg_rows]
 
-        # 4. Find shortest threat proximity (hops from endpoint to nearest ThreatIndicator)
-        threat_rows = self._execute(
+        # 4. Find direct threats on the target endpoint (threat_proximity=1)
+        threat_rows = await self._execute(
             """
             MATCH (e:Endpoint {endpoint_id: $ep_id})-[:EXPOSED_TO]->(t:ThreatIndicator)
             RETURN count(t) AS threat_count
@@ -223,7 +265,7 @@ class RiskGraph:
         endpoint_id: str,
     ) -> bool:
         """Verify AUTHORIZED_FOR edge exists; raise UnauthorizedAgentError if not."""
-        rows = self._execute(
+        rows = await self._execute(
             """
             MATCH (a:Agent {agent_id: $agent_id})-[:AUTHORIZED_FOR]->(e:Endpoint {endpoint_id: $ep_id})
             RETURN count(*) AS cnt
@@ -237,14 +279,14 @@ class RiskGraph:
 
     async def get_endpoint_id_for_url(self, url: str) -> str | None:
         """Look up endpoint_id by URL."""
-        rows = self._execute(
+        rows = await self._execute(
             "MATCH (e:Endpoint {url: $url}) RETURN e.endpoint_id AS endpoint_id",
             {"url": url},
         )
         return rows[0]["endpoint_id"] if rows else None
 
     async def agent_exists(self, agent_id: str) -> bool:
-        rows = self._execute(
+        rows = await self._execute(
             "MATCH (a:Agent {agent_id: $agent_id}) RETURN count(*) AS cnt",
             {"agent_id": agent_id},
         )
