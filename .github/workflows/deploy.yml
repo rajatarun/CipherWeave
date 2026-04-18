@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - claude/cipherweave-mvp-v0.1-1ibLe
   workflow_dispatch:
     inputs:
       stage:
