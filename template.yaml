@@ -184,6 +184,7 @@ Resources:
       Description: CipherWeave MCP tool endpoint (HTTP/SSE transport)
       AccessLogSettings:
         DestinationArn: !GetAtt CipherWeaveApiLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","integrationError":"$context.integrationErrorMessage"}'
       DefaultRouteSettings:
         ThrottlingBurstLimit: 50
         ThrottlingRateLimit: 100
