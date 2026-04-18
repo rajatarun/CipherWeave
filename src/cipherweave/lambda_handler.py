@@ -167,6 +167,20 @@ async def _dispatch(event: dict) -> dict:
 # Lambda entry point
 # ---------------------------------------------------------------------------
 def handler(event: dict, context: object) -> dict:
+    # Temporary debug probe — remove once path routing is confirmed
+    if event.get("rawPath", "").rstrip("/") == "/_debug":
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({
+                "rawPath": event.get("rawPath"),
+                "routeKey": event.get("routeKey"),
+                "version": event.get("version"),
+                "http_path": event.get("requestContext", {}).get("http", {}).get("path"),
+                "stage": event.get("requestContext", {}).get("stage"),
+            }),
+        }
+
     try:
         _ensure_init()
     except Exception as exc:
