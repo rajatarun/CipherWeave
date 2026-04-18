@@ -51,29 +51,9 @@ _initialized = False
 
 
 async def _start_lifespan(app) -> None:
-    """Send ASGI lifespan.startup to app and wait for startup.complete.
-
-    FastMCP 3.x requires the ASGI lifespan to run before it will handle
-    HTTP requests (its internal anyio task group is created during startup).
-    Mangum's built-in lifespan support is unreliable in the Lambda Python
-    3.12 runtime, so we drive it manually here once per cold start.
-    """
-    startup_done = asyncio.Event()
-    receive_queue: asyncio.Queue = asyncio.Queue()
-    await receive_queue.put({"type": "lifespan.startup"})
-
-    async def receive():
-        return await receive_queue.get()
-
-    async def send(message):
-        if message["type"] == "lifespan.startup.complete":
-            startup_done.set()
-
-    # Run lifespan as a background task so it stays alive during requests
-    _loop.create_task(
-        app({"type": "lifespan", "asgi": {"version": "3.0", "spec_version": "2.0"}}, receive, send)
-    )
-    await asyncio.wait_for(startup_done.wait(), timeout=15)
+    """Enter FastMCP's lifespan context to initialize its internal task group."""
+    ctx = app.lifespan(app)
+    await ctx.__aenter__()
     logger.info("FastMCP ASGI lifespan started")
 
 
