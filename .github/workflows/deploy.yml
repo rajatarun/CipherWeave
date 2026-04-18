@@ -221,6 +221,10 @@ jobs:
       - name: Invoke SeedGraph Lambda
         run: |
           SEED_ARN="${{ needs.deploy.outputs.seed_function_arn }}"
+          if [ -z "$SEED_ARN" ]; then
+            echo "❌ seed_function_arn is empty — deploy job did not output it"
+            exit 1
+          fi
           echo "Invoking: $SEED_ARN"
           echo "Memgraph target: ${{ needs.deploy.outputs.memgraph_host }}:7687"
 
@@ -250,7 +254,11 @@ jobs:
           echo "Memgraph: \`${{ needs.deploy.outputs.memgraph_host }}:7687\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "\`\`\`json" >> "$GITHUB_STEP_SUMMARY"
-          cat /tmp/seed_response.json >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /tmp/seed_response.json ]; then
+            cat /tmp/seed_response.json >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '{"status":"no_response_file"}' >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
 
