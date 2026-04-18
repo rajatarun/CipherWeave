@@ -172,3 +172,41 @@ The benchmark suite tests against `MockRiskGraph` to validate the non-graph over
 **Rationale**: CipherWeave policy decisions should cover the endpoints that agents actually call. Seeding real endpoints means agents sending data to `contextweave-rag-prod` will immediately get policy decisions without manual graph construction.
 
 **Security implication**: The `ep-contextweave-api` endpoint is not VPC-internal, so agents accessing it will get `BALANCED` or higher profiles depending on the data classification. TRADE_SECRET assets mapped to this endpoint will trigger `QUANTUM_SAFE`.
+
+---
+
+## ADR-016: JIT Endpoint Registration with Bedrock Policy Inference
+
+**Decision**: When `get_encryption_strategy` is called for an unknown agent/endpoint pair, CipherWeave infers the encryption policy from `data_metadata` via a Bedrock LLM call, then upserts the full graph path (Agent → DataAsset → Endpoint, Regulation nodes, all edges) into Memgraph before proceeding with the normal risk evaluation. Pre-seeding the graph is no longer a deployment prerequisite.
+
+**Rationale**: Real-world deployments have URLs that change constantly — new services, blue/green deployments, feature branches. Requiring operators to manually seed every agent/endpoint pair before production traffic is a brittle coupling between the deploy pipeline and CipherWeave state. JIT registration removes this coupling: the graph self-populates as agents make real requests.
+
+**Why Bedrock for inference (not hardcoded rules only)**: The rule-based routing table (ADR-007) works well for well-labelled metadata but cannot interpret free-form fields like `description`, `data_type`, or `contains_pii`. A small LLM (Haiku 4.5) can parse these contextual signals and return a structured policy decision. The rule table remains as the local dev / test fallback when no Bedrock client is present.
+
+**Strict metadata enforcement**: The inference function requires `classification` (must be one of the five valid levels) and `tags` (list, may be empty). If either is missing or unrecognized, `MetadataInferenceError` is raised immediately. The model is prompted with `can_infer: false` semantics — if it cannot confidently determine a policy, it signals failure and the call is rejected rather than silently defaulting. This prevents policy under-enforcement from malformed requests.
+
+**Idempotency**: Node IDs are deterministic sha256 hashes of the URL (endpoint) and `agent_id:url` (asset). Repeated JIT calls for the same pair are safe MERGE operations — no duplicate nodes.
+
+**JIT vs. pre-seeded nodes**: JIT-registered nodes carry `jit_registered: true`. Operators can audit or prune them separately. Pre-seeded nodes from `seed_graph.py` carry richer metadata (VPC flags, explicit regulation edges, threat indicators) and take precedence because they are written first.
+
+**Trade-off**: The first call for an unknown pair incurs Bedrock inference latency (~1–2s on a cold NAT path). Subsequent calls hit the warm Memgraph path (~2–5ms). The DriftDetector also fires `NEW_AGENT` on the first call, upgrading the profile to `QUANTUM_SAFE` as a fail-secure measure — this is intentional.
+
+**Infrastructure requirement**: The Lambda subnet needs outbound internet access to reach Bedrock (NAT gateway or NAT instance). A `bedrock-runtime` VPC endpoint is the lower-latency alternative for production.
+
+---
+
+## ADR-017: Custom ASGI Adapter for Lambda (No Mangum)
+
+**Decision**: Rather than using Mangum as the ASGI–Lambda adapter, CipherWeave implements a minimal bespoke adapter in `lambda_handler.py`.
+
+**Rationale**: Mangum is synchronous and calls `loop.run_until_complete()` internally. On Python 3.12, when the Lambda handler itself already runs inside an event loop (as required for the per-invocation `async with _asgi_app.lifespan(...)` pattern), Mangum's nested call raises `RuntimeError: This event loop is already running`.
+
+FastMCP 3.x uses contextvars internally. Lifespan `__aenter__()` tokens must be reset in the same `Context` they were created in. Running lifespan startup once at cold-start and dispatching in subsequent `run_until_complete()` calls puts them in different Contexts, causing `ValueError` on `token.reset()`. The per-invocation `async with` keeps everything in one Context per call.
+
+**What the adapter does**:
+1. Converts an API Gateway HTTP v2 (payload format 2.0) event into an ASGI `http` scope
+2. Strips the stage prefix (`/prod`) from `rawPath` so FastMCP sees `/mcp`
+3. Implements `receive` and `send` callables with a `response_complete` event to avoid premature SSE disconnection
+4. Enters and exits the FastMCP lifespan within a single coroutine invocation
+
+**Trade-off**: The custom adapter must be maintained if FastMCP's ASGI interface changes. It covers only API GW HTTP v2 (payload format 2.0) — REST API (v1) events are not supported.
