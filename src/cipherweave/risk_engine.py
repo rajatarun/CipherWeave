@@ -88,7 +88,7 @@ def _invoke_bedrock_sync(client: Any, model_id: str, metadata: dict) -> dict:
 async def infer_policy_from_metadata(
     data_metadata: dict,
     bedrock_client: Any = None,
-    model_id: str = "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+    model_id: str = "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 ) -> tuple[str, list[str], CipherProfile, float, str]:
     """Strictly validate metadata and infer (classification, regulations, profile, score, justification).
 
