@@ -124,7 +124,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
       - name: Set up SAM CLI
         uses: aws-actions/setup-sam@v2
