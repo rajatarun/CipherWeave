@@ -1,7 +1,16 @@
 # SAM CLI default configuration for CipherWeave
-# Override any value with --parameter-overrides or environment-specific profiles.
-# The deploy workflow populates VpcId, SubnetIds, and MemgraphSecurityGroupId
-# dynamically from the Memgraph EC2 instance (i-04b2d0f387d2c7d53).
+#
+# MemgraphHost, KMSKeyArn, VpcId, SubnetIds, and MemgraphSecurityGroupId are
+# intentionally absent here — the GitHub Actions workflow reads them live from
+# the contextweave-rag-prod CloudFormation stack and passes them via
+# --parameter-overrides at deploy time.
+#
+# For local sam deploy (rare), export the values first:
+#   export MEMGRAPH_HOST=$(aws cloudformation describe-stacks \
+#     --stack-name contextweave-rag-prod \
+#     --query "Stacks[0].Outputs[?OutputKey=='MemgraphPrivateIP'].OutputValue" \
+#     --output text)
+#   sam deploy --parameter-overrides "MemgraphHost=$MEMGRAPH_HOST ..."
 
 version = 0.1
 
@@ -11,7 +20,7 @@ stack_name = "cipherweave-prod"
 region     = "us-east-1"
 
 [default.build.parameters]
-use_container = false       # Pure-Python deps — no container needed
+use_container = false   # Pure-Python deps — no container needed
 cached        = true
 
 [default.deploy.parameters]
@@ -21,12 +30,12 @@ region                  = "us-east-1"
 confirm_changeset       = false
 fail_on_empty_changeset = false
 capabilities            = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
-# Parameter defaults — VPC values injected by GitHub Actions workflow
-parameter_overrides     = [
+# Only stable, non-environment-specific defaults here.
+# MemgraphHost, KMSKeyArn, VpcId, SubnetIds, MemgraphSecurityGroupId
+# are injected by the deploy workflow from contextweave-rag-prod outputs.
+parameter_overrides = [
     "Stage=prod",
-    "MemgraphHost=172.31.12.134",
     "MemgraphPort=7687",
-    "KMSKeyArn=arn:aws:kms:us-east-1:239571291755:key/49eac3db-1f3a-4c91-98ac-61ae722dcaff",
     "UseLocalKMS=false",
     "LogLevel=INFO",
 ]
@@ -36,7 +45,7 @@ parameter_overrides     = [
 stack_name = "cipherweave-staging"
 parameter_overrides = [
     "Stage=staging",
-    "MemgraphHost=172.31.12.134",
+    "MemgraphPort=7687",
     "UseLocalKMS=false",
     "LogLevel=DEBUG",
 ]

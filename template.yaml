@@ -2,12 +2,16 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   CipherWeave v0.1 — Agentic Cryptography Intelligence Layer.
-  Deploys alongside the contextweave-rag-prod stack, reusing its
-  Memgraph EC2 instance, KMS key, and VPC networking.
+  Deploys alongside contextweave-rag-prod, reusing its Memgraph EC2 instance,
+  KMS key, and VPC. All infrastructure parameters are sourced from that stack's
+  CloudFormation outputs at deploy time — nothing is hardcoded.
 
 # ---------------------------------------------------------------------------
-# Parameters — all have sensible defaults from the contextweave-rag-prod
-# CloudFormation outputs visible in the deployment screenshot.
+# Parameters — environment-specific values (MemgraphHost, KMSKeyArn, VPC
+# details) have NO defaults. They are always supplied by the deploy workflow,
+# which reads them live from the contextweave-rag-prod CloudFormation stack.
+# Hardcoding infrastructure IDs here would cause silent drift when the source
+# stack is updated or re-deployed to a different account/region.
 # ---------------------------------------------------------------------------
 Parameters:
   Stage:
@@ -17,8 +21,9 @@ Parameters:
 
   MemgraphHost:
     Type: String
-    Default: "172.31.12.134"
-    Description: Private IP of the Memgraph EC2 instance (MemgraphPrivateIP output)
+    Description: >
+      Private IP of the Memgraph EC2 instance.
+      Sourced from contextweave-rag-prod MemgraphPrivateIP output at deploy time.
 
   MemgraphPort:
     Type: String
@@ -26,8 +31,9 @@ Parameters:
 
   KMSKeyArn:
     Type: String
-    Default: "arn:aws:kms:us-east-1:239571291755:key/49eac3db-1f3a-4c91-98ac-61ae722dcaff"
-    Description: KMS key ARN for master secret derivation (KMSKeyArn output)
+    Description: >
+      KMS key ARN for master secret derivation.
+      Sourced from contextweave-rag-prod KMSKeyArn output at deploy time.
 
   # VPC networking — fetched from EC2 instance metadata in the deploy workflow
   VpcId:
