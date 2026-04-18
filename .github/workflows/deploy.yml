@@ -72,12 +72,23 @@ jobs:
             --query "Stacks[0].Outputs" \
             --output json)
 
+          echo "All outputs from $SOURCE_STACK:"
+          echo "$OUTPUTS" | jq -r '.[] | "\(.OutputKey) = \(.OutputValue)"'
+
           get() { echo "$OUTPUTS" | jq -r --arg k "$1" '.[] | select(.OutputKey==$k) | .OutputValue'; }
 
           MEMGRAPH_INSTANCE_ID=$(get MemgraphInstanceId)
           MEMGRAPH_HOST=$(get MemgraphPrivateIP)
           KMS_KEY_ARN=$(get KMSKeyArn)
-          ARTIFACT_BUCKET=$(get ArtifactBucket)
+
+          # Try the confirmed key first, then fallbacks
+          ARTIFACT_BUCKET=$(get ArtifactsBucketName)
+          [ -z "$ARTIFACT_BUCKET" ] && ARTIFACT_BUCKET=$(get ArtifactBucket)
+          [ -z "$ARTIFACT_BUCKET" ] && ARTIFACT_BUCKET=$(get ArtifactsBucket)
+          [ -z "$ARTIFACT_BUCKET" ] && ARTIFACT_BUCKET=$(get SAMArtifactsBucket)
+          [ -z "$ARTIFACT_BUCKET" ] && ARTIFACT_BUCKET=$(get SamArtifactsBucket)
+          [ -z "$ARTIFACT_BUCKET" ] && ARTIFACT_BUCKET=$(get DeploymentBucket)
+          [ -z "$ARTIFACT_BUCKET" ] && ARTIFACT_BUCKET=$(get S3BucketName)
 
           echo "memgraph_instance_id=$MEMGRAPH_INSTANCE_ID" >> "$GITHUB_OUTPUT"
           echo "memgraph_host=$MEMGRAPH_HOST"               >> "$GITHUB_OUTPUT"
@@ -87,7 +98,7 @@ jobs:
           echo "✅ MemgraphInstance: $MEMGRAPH_INSTANCE_ID"
           echo "✅ MemgraphHost:     $MEMGRAPH_HOST"
           echo "✅ KMSKeyArn:        ${KMS_KEY_ARN:0:50}..."
-          echo "✅ ArtifactBucket:   $ARTIFACT_BUCKET"
+          echo "✅ ArtifactBucket:   ${ARTIFACT_BUCKET:-'(not found — will use --resolve-s3)'}"
 
       # ── 4. Resolve VPC/Subnet/SG from the Memgraph EC2 instance ─────────
       # Uses the instance ID fetched from CFN — not hardcoded.
@@ -128,11 +139,20 @@ jobs:
       # ── 7. SAM Deploy ────────────────────────────────────────────────────
       - name: SAM Deploy
         run: |
+          S3_BUCKET="${{ steps.source_stack.outputs.artifact_bucket }}"
+          if [ -n "$S3_BUCKET" ]; then
+            BUCKET_ARGS="--s3-bucket $S3_BUCKET"
+            echo "✅ Using artifact bucket: $S3_BUCKET"
+          else
+            echo "⚠️  No artifact bucket found in CFN outputs — falling back to --resolve-s3"
+            BUCKET_ARGS="--resolve-s3"
+          fi
+
           sam deploy \
             --config-file samconfig.toml \
             --config-env default \
             --stack-name "$STACK_NAME" \
-            --s3-bucket "${{ steps.source_stack.outputs.artifact_bucket }}" \
+            $BUCKET_ARGS \
             --s3-prefix "cipherweave/$STAGE" \
             --region "$AWS_REGION" \
             --no-confirm-changeset \
