@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from cipherweave.drift_detector import DriftDetector
+from cipherweave.drift_detector import DEFAULT_N_MIN, DriftDetector
+
+#: Observations needed before the detector will trust a baseline (Eq. 3 cold start).
+_BASELINE_N = DEFAULT_N_MIN + 5
 from cipherweave.profiles import CipherProfile
 
 
@@ -27,8 +30,9 @@ async def test_new_agent_defaults_to_quantum_safe(drift_detector: DriftDetector)
 async def test_drift_detection_pii_to_cheap(drift_detector: DriftDetector) -> None:
     """Agent typically BALANCED, requests CHEAP for PII → anomaly + QUANTUM_SAFE override."""
     agent_id = "agent-drifter"
-    # Establish BALANCED history
-    for i in range(5):
+    # Establish a BALANCED baseline. The detector requires n_min observations before
+    # it will trust a baseline at all (cold start is fail-secure), so seed past it.
+    for i in range(_BASELINE_N):
         await drift_detector.log_decision(agent_id, CipherProfile.BALANCED, "ep-001", 0.35)
 
     is_anomalous, alert = await drift_detector.detect_anomaly(
@@ -48,7 +52,7 @@ async def test_drift_detection_pii_to_cheap(drift_detector: DriftDetector) -> No
 async def test_no_drift_consistent_behavior(drift_detector: DriftDetector) -> None:
     """Agent consistently uses BALANCED — no anomaly on same request."""
     agent_id = "agent-steady"
-    for i in range(10):
+    for i in range(_BASELINE_N):
         await drift_detector.log_decision(agent_id, CipherProfile.BALANCED, "ep-001", 0.35)
 
     is_anomalous, alert = await drift_detector.detect_anomaly(
@@ -82,8 +86,8 @@ async def test_drift_upgrade_accepted(drift_detector: DriftDetector) -> None:
 async def test_unfamiliar_endpoint_anomaly(drift_detector: DriftDetector) -> None:
     """Agent with established history requests key for new endpoint → anomaly."""
     agent_id = "agent-explorer"
-    for i in range(5):
-        await drift_detector.log_decision(agent_id, CipherProfile.BALANCED, f"ep-{i:03}", 0.35)
+    for i in range(_BASELINE_N):
+        await drift_detector.log_decision(agent_id, CipherProfile.BALANCED, f"ep-{i % 4:03}", 0.35)
 
     is_anomalous, alert = await drift_detector.detect_anomaly(
         agent_id=agent_id,

@@ -20,6 +20,11 @@ class PathRiskResult(BaseModel):
     recommended_profile: CipherProfile
     risk_score: float = Field(ge=0.0, le=1.0)
     justification: str
+    # Aggregation detail (Eq. 1/2) retained for the audit record.
+    evidence_mass: float = 0.0
+    evidence_trail: list[str] = Field(default_factory=list)
+    nodes_visited: int = 0
+    compliance_floor: CipherProfile | None = None
 
 
 class DerivedKeyResult(BaseModel):

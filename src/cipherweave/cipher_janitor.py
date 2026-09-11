@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from cipherweave.exceptions import KMSError, SaltReuseError
+from cipherweave.exceptions import KMSError, PostQuantumUnavailableError, SaltReuseError
 from cipherweave.models import DerivedKeyResult, HybridKeyPair
 from cipherweave.profiles import CipherProfile
 
@@ -198,28 +198,80 @@ class CipherJanitor:
         self._ctx_buffers.append(buf)
 
 
-def _mlkem_generate_keypair() -> tuple[bytes, bytes]:
-    """Generate ML-KEM-768 keypair. Returns (public_key, private_key)."""
-    try:
-        import mlkem  # type: ignore[import]
+# --- ML-KEM-768 backend -----------------------------------------------------
+#
+# SECURITY: there is deliberately NO stub fallback here. An earlier revision
+# returned os.urandom() when no ML-KEM implementation was installed, which meant
+# the QUANTUM_SAFE profile silently degraded to no post-quantum protection at all
+# (and, because decapsulation returned fresh random bytes, the two peers derived
+# DIFFERENT secrets). A silent downgrade of the strongest profile is exactly the
+# failure the fail-secure design exists to prevent, so a missing backend is now a
+# hard error raised at call time.
 
-        # mlkem library API: keygen() → (ek, dk) where ek=encaps key, dk=decaps key
-        ek, dk = mlkem.keygen(768)
-        return ek, dk
-    except ImportError:
-        logger.warning("mlkem not installed — using random bytes stub for ML-KEM-768 keys")
-        # Stub: realistic key sizes for ML-KEM-768
-        # Public key: 1184 bytes, Private key: 2400 bytes
-        return os.urandom(1184), os.urandom(2400)
+_MLKEM_ALG = "ML-KEM-768"
+_MLKEM_BACKEND: str | None = None
+
+try:  # preferred: liboqs (native)
+    import oqs as _oqs  # type: ignore[import]
+
+    if _MLKEM_ALG in _oqs.get_enabled_kem_mechanisms():
+        _MLKEM_BACKEND = "liboqs"
+    else:  # pragma: no cover - depends on how liboqs was built
+        _oqs = None  # type: ignore[assignment]
+except Exception:  # pragma: no cover
+    _oqs = None  # type: ignore[assignment]
+
+if _MLKEM_BACKEND is None:
+    try:  # fallback: pure-Python reference implementation
+        from kyber_py.ml_kem import ML_KEM_768 as _ml_kem_768  # type: ignore[import]
+
+        _MLKEM_BACKEND = "kyber-py"
+    except Exception:  # pragma: no cover
+        _ml_kem_768 = None  # type: ignore[assignment]
+
+
+def mlkem_backend() -> str | None:
+    """Name of the active ML-KEM backend, or None when unavailable."""
+    return _MLKEM_BACKEND
+
+
+def _require_mlkem() -> str:
+    if _MLKEM_BACKEND is None:
+        raise PostQuantumUnavailableError(_MLKEM_ALG)
+    return _MLKEM_BACKEND
+
+
+def _mlkem_generate_keypair() -> tuple[bytes, bytes]:
+    """Generate an ML-KEM-768 keypair. Returns (public_key, private_key).
+
+    Raises PostQuantumUnavailableError when no backend is installed.
+    """
+    backend = _require_mlkem()
+    if backend == "liboqs":
+        kem = _oqs.KeyEncapsulation(_MLKEM_ALG)
+        public_key = kem.generate_keypair()
+        private_key = kem.export_secret_key()
+        kem.free()
+        return public_key, private_key
+    ek, dk = _ml_kem_768.keygen()
+    return bytes(ek), bytes(dk)
+
+
+def _mlkem_encapsulate(public_key: bytes) -> tuple[bytes, bytes]:
+    """Encapsulate to an ML-KEM-768 public key. Returns (ciphertext, shared_secret)."""
+    backend = _require_mlkem()
+    if backend == "liboqs":
+        with _oqs.KeyEncapsulation(_MLKEM_ALG) as kem:
+            ciphertext, shared = kem.encap_secret(public_key)
+        return ciphertext, shared
+    key, ciphertext = _ml_kem_768.encaps(public_key)
+    return bytes(ciphertext), bytes(key)
 
 
 def _mlkem_decapsulate(private_key: bytes, ciphertext: bytes) -> bytes:
-    """Decapsulate ML-KEM-768 ciphertext to recover shared secret."""
-    try:
-        import mlkem  # type: ignore[import]
-
-        shared_secret: bytes = mlkem.decaps(768, private_key, ciphertext)
-        return shared_secret
-    except ImportError:
-        # Stub: return 32-byte random shared secret
-        return os.urandom(32)
+    """Decapsulate an ML-KEM-768 ciphertext to recover the shared secret."""
+    backend = _require_mlkem()
+    if backend == "liboqs":
+        with _oqs.KeyEncapsulation(_MLKEM_ALG, secret_key=private_key) as kem:
+            return kem.decap_secret(ciphertext)
+    return bytes(_ml_kem_768.decaps(private_key, ciphertext))

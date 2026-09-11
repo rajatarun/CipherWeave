@@ -15,9 +15,6 @@ class CipherProfile(str, Enum):
     BALANCED = "BALANCED"          # AES-256-GCM + HKDF-SHA256
     CHEAP = "CHEAP"                # AES-128-GCM + HKDF-SHA256
 
-    # Ordering for comparison (higher index = stronger)
-    _ORDER = None  # populated below
-
     def strength(self) -> int:
         """Numeric strength: higher = stronger. Used for fail-secure upgrades."""
         return _STRENGTH[self]

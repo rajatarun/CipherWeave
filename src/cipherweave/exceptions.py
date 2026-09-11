@@ -65,3 +65,19 @@ class MetadataInferenceError(CipherWeaveError):
         self.field = field
         self.reason = reason
         super().__init__(f"Cannot infer policy from metadata — {field}: {reason}")
+
+
+class PostQuantumUnavailableError(CipherWeaveError):
+    """Raised when a post-quantum profile is requested but no ML-KEM backend exists.
+
+    This is deliberately fatal rather than a silent downgrade: a QUANTUM_SAFE
+    decision that cannot be honoured must fail closed, not quietly return a
+    classical-only (or worse, random-stub) key.
+    """
+
+    def __init__(self, algorithm: str) -> None:
+        self.algorithm = algorithm
+        super().__init__(
+            f"{algorithm} backend unavailable. Install an ML-KEM implementation "
+            "(liboqs-python, or kyber-py) — refusing to downgrade a post-quantum profile."
+        )
