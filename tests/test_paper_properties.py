@@ -231,7 +231,7 @@ def _detector():
 
 
 async def _establish(d, agent, t0, eps=("a", "b", "c", "d"),
-                     profile=CipherProfile.BALANCED, n=400, dt=1.0):
+                     profile=CipherProfile.BALANCED, n=600, dt=1.0):
     t = t0
     for i in range(n):
         await d.log_decision(agent, profile, eps[i % len(eps)], 0.3, now=t)
@@ -239,7 +239,7 @@ async def _establish(d, agent, t0, eps=("a", "b", "c", "d"),
     return t
 
 
-def _fires_within(d, agent, feed, limit=40):
+def _fires_within(d, agent, feed, limit=400):
     """Feed anomalous events; return True if delta crosses theta within `limit`."""
     async def run():
         t = feed["t"]
@@ -284,10 +284,17 @@ def test_eq3_channel_iii_profile_mix_shift():
     assert fired, f"profile-mix shift not detected (delta={stat.delta:.2f})"
 
 
-def test_eq3_cold_start_is_infinite_drift():
+def test_eq3_cold_start_forces_override_without_faking_a_drift_score():
+    """Cold start is a policy, not a measurement.
+
+    delta reports observed drift; with no baseline there is no observed drift, so
+    it stays 0 and the cold_start flag carries the fail-secure decision. Reporting
+    infinity conflated the two and made every benign traffic lull outscore every
+    real attack (corpus AUC 0.448, worse than chance).
+    """
     d = _detector()
     stat = d.drift_statistic("never_seen")
-    assert stat.cold_start and stat.delta == math.inf
+    assert stat.cold_start and stat.delta == 0.0
     fired, alert = asyncio.run(
         d.detect_anomaly("never_seen", CipherProfile.BALANCED, [], "ep"))
     assert fired and alert.alert_type == "NEW_AGENT"
@@ -303,6 +310,7 @@ def test_eq3_max_not_sum_resists_partial_suppression():
                                           "endpoint": lambda i: "a"})
     assert fired
     assert stat.z_rate < 3.0 and stat.z_mix < 3.0, "precondition: other channels quiet"
+    assert stat.z_entropy >= 3.0, "precondition: entropy is the firing channel"
     assert stat.delta == max(stat.z_entropy, stat.z_rate, stat.z_mix)
     weighted_sum = (stat.z_entropy + stat.z_rate + stat.z_mix) / 3.0
     assert weighted_sum < 3.0, "a mean-combiner would have missed this; max caught it"

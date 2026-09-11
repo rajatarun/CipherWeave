@@ -53,7 +53,28 @@ DEFAULT_ALPHA: float = 0.2          # EWMA decay
 DEFAULT_TAU_JS: float = 0.25        # JS-divergence scale (a near-total mix flip clears theta)
 DEFAULT_WINDOW_SECONDS: float = 300.0
 DEFAULT_N_MIN: int = 20             # cold-start floor
-VARIANCE_FLOOR: float = 1e-3        # epsilon
+VARIANCE_FLOOR: float = 1e-3         # absolute epsilon, last resort only
+
+#: Minimum coefficient of variation we will credit when standardising a channel.
+#:
+#: Consecutive windows overlap in all but one event, so their statistics are
+#: strongly autocorrelated and an EWMA variance over them measures step-to-step
+#: jitter rather than the statistic's real variability. Left uncorrected this
+#: drives sigma toward zero and z toward infinity: a measured baseline of
+#: mu=0.091, sigma=0.0105 on ordinary interactive traffic made an 11% rate wobble
+#: score z=3, and benign episodes peaked at delta=5.4. Refusing to believe a
+#: coefficient of variation below this floor bounds that inflation.
+MIN_COEFF_VARIATION: float = 0.15
+
+#: Baselines are sampled at most once per this fraction of the window, so
+#: successive samples share less of their support and the variance estimate is
+#: not dominated by window overlap.
+BASELINE_SAMPLE_FRACTION: float = 0.25
+
+#: A window must span at least this fraction of `window_seconds` before it is
+#: treated as describing steady state -- for baseline sampling and for the rate
+#: channel alike.
+WINDOW_MATURITY_FRACTION: float = 0.5
 
 #: Operations exempt from override: side-effect-free and cannot mutate state.
 READ_ONLY_OPERATIONS: frozenset[str] = frozenset({"status", "health", "get_status"})
@@ -119,12 +140,19 @@ class _Baseline:
     def sigma(self) -> float:
         return math.sqrt(max(self.var, 0.0))
 
+    def scaled_sigma(self) -> float:
+        """sigma, floored relative to the mean (see MIN_COEFF_VARIATION)."""
+        return max(self.sigma,
+                   MIN_COEFF_VARIATION * abs(self.mean),
+                   VARIANCE_FLOOR)
+
 
 class _AgentState:
     def __init__(self, alpha: float) -> None:
         self.records: deque[tuple[float, CipherProfile, str]] = deque(maxlen=4096)
         self.entropy = _Baseline(alpha)
         self.rate = _Baseline(alpha)
+        self.last_sample_t: float | None = None
         self.profile_mix: list[float] = [1.0 / len(_PROFILES)] * len(_PROFILES)
         self.alpha = alpha
 
@@ -198,8 +226,24 @@ class DriftDetector:
     # --- Eq. (3) ---------------------------------------------------------
 
     def _window(self, agent_id: str, now: float) -> list[tuple[float, CipherProfile, str]]:
+        """Records inside the trailing window.
+
+        Records are appended in time order and `_evict` drops anything older than
+        one window on write, so the deque is already bounded to the window and this
+        is O(window) rather than O(all history). Scanning the full retained history
+        on every statistic made replaying a long episode quadratic.
+        """
         cutoff = now - self._window_seconds
-        return [rec for rec in self._state[agent_id].records if rec[0] >= cutoff]
+        recs = self._state[agent_id].records
+        if recs and recs[0][0] >= cutoff:
+            return list(recs)
+        return [rec for rec in recs if rec[0] >= cutoff]
+
+    def _evict(self, agent_id: str, now: float) -> None:
+        cutoff = now - self._window_seconds
+        recs = self._state[agent_id].records
+        while recs and recs[0][0] < cutoff:
+            recs.popleft()
 
     def drift_statistic(self, agent_id: str, now: float | None = None) -> DriftStatistic:
         """Compute delta_a from the agent's trailing window against its EWMA baselines."""
@@ -207,15 +251,22 @@ class DriftDetector:
         st = self._state[agent_id]
         window = self._window(agent_id, now)
 
-        if len(window) < self._n_min:
-            return DriftStatistic(math.inf, 0.0, 0.0, 0.0, True, len(window))
+        # Baselines that have never been sampled cannot standardise anything:
+        # dividing by the absolute epsilon turned an ordinary entropy of 2.0 into
+        # z = 2000. Treat "no baseline yet" exactly like "not enough events yet".
+        if st.entropy.n == 0 or st.rate.n == 0 or len(window) < self._n_min:
+            # No usable baseline. delta is 0 -- absence of evidence is not evidence
+            # of drift -- and the cold_start flag carries the fail-secure policy.
+            # Reporting infinity here instead made every benign traffic lull
+            # outscore every real attack and inverted the ranking (AUC 0.448).
+            return DriftStatistic(0.0, 0.0, 0.0, 0.0, True, len(window))
 
         # (i) destination entropy — two-sided
         ep_counts: dict[str, int] = defaultdict(int)
         for _, _, ep in window:
             ep_counts[ep] += 1
         h = shannon_entropy(ep_counts)
-        z_h = abs(h - st.entropy.mean) / max(st.entropy.sigma, VARIANCE_FLOOR)
+        z_h = abs(h - st.entropy.mean) / st.entropy.scaled_sigma()
 
         # (ii) request rate — one-sided (only increases are suspicious).
         # A rate deviation is only meaningful once the window spans enough time to
@@ -223,10 +274,10 @@ class DriftDetector:
         # filling, and scoring it would flag every agent that merely starts up.
         lam = len(window) / self._window_seconds
         span = window[-1][0] - window[0][0]
-        if span < 0.5 * self._window_seconds:
+        if span < WINDOW_MATURITY_FRACTION * self._window_seconds:
             z_lam = 0.0
         else:
-            z_lam = max(lam - st.rate.mean, 0.0) / max(st.rate.sigma, VARIANCE_FLOOR)
+            z_lam = max(lam - st.rate.mean, 0.0) / st.rate.scaled_sigma()
 
         # (iii) profile-mix divergence
         mix_counts = [0.0] * len(_PROFILES)
@@ -255,6 +306,12 @@ class DriftDetector:
 
         stat = self.drift_statistic(agent_id, now=now)
 
+        # Semantic rules need no baseline and name a specific condition, so they
+        # are reported in preference to the generic statistic or a cold-start.
+        semantic = self._semantic_rules(agent_id, requested_profile, data_tags, endpoint_id)
+        if semantic is not None:
+            return True, _alert(agent_id, semantic[0], semantic[1], semantic[2], semantic[3], stat)
+
         if stat.cold_start:
             return True, _alert(
                 agent_id, "NEW_AGENT", "HIGH",
@@ -275,13 +332,18 @@ class DriftDetector:
                 stat,
             )
 
-        # Semantic channel — single-shot events a distributional statistic cannot see.
-        semantic = self._semantic_rules(agent_id, requested_profile, data_tags, endpoint_id)
-        if semantic is not None:
-            return True, _alert(agent_id, semantic[0], semantic[1], semantic[2], semantic[3], stat)
-
         return False, None
 
+    # NOTE: a "first-seen endpoint" rule used to live here and was removed after
+    # measurement. Reaching a new endpoint is not evidence of compromise: every
+    # long-running agent does it, and on a heavy-tailed destination distribution it
+    # happens indefinitely. The rule produced a 100% false-positive rate on the
+    # corpus's `crawler` and `expanding` archetypes and 40-52% on `bursty_etl`,
+    # and tightening it did not help, because the benign first-contact rate (~3%)
+    # sits below any threshold that would still catch an attacker. Dispersion
+    # changes are the entropy channel's job; *whether an agent may talk to an
+    # endpoint at all* is authorization, enforced deterministically by
+    # RiskGraph.validate_agent_authorization, not inferred statistically here.
     def _semantic_rules(
         self,
         agent_id: str,
@@ -309,12 +371,6 @@ class DriftDetector:
                     f"Agent '{agent_id}' requests CHEAP for sensitive data {data_tags}; "
                     f"typical profile is {dominant.value}. Overriding to QUANTUM_SAFE.",
                     "Investigate agent configuration or potential compromise.")
-
-        if endpoint_id not in seen_endpoints:
-            return ("UNAUTHORIZED_ENDPOINT", "HIGH",
-                    f"Agent '{agent_id}' requests a key for first-seen endpoint "
-                    f"'{endpoint_id}'. Overriding to QUANTUM_SAFE.",
-                    "Verify the agent is authorized for this endpoint.")
 
         if dominant.strength() - requested_profile.strength() >= 2:
             return ("DRIFT_DETECTED", "HIGH",
@@ -346,6 +402,7 @@ class DriftDetector:
         now = time.monotonic() if now is None else now
         st = self._state[agent_id]
         st.records.append((now, profile, endpoint_id))
+        self._evict(agent_id, now)
 
         if not update_baseline:
             self._history[agent_id].append(
@@ -356,12 +413,22 @@ class DriftDetector:
             )
             return
 
+        stride = self._window_seconds * BASELINE_SAMPLE_FRACTION
         window = self._window(agent_id, now)
-        ep_counts: dict[str, int] = defaultdict(int)
-        for _, _, ep in window:
-            ep_counts[ep] += 1
-        st.entropy.update(shannon_entropy(ep_counts))
-        st.rate.update(len(window) / self._window_seconds)
+        span = (window[-1][0] - window[0][0]) if len(window) > 1 else 0.0
+        mature = span >= WINDOW_MATURITY_FRACTION * self._window_seconds
+        due = st.last_sample_t is None or (now - st.last_sample_t) >= stride
+        # Only a mature window describes steady-state behaviour. Sampling during
+        # warm-up, while the window is still filling, measures the fill itself:
+        # on 4 uniform endpoints it put the entropy baseline at mu=1.35 against a
+        # true 2.00 and inflated sigma to 0.94, which blinded the channel.
+        if mature and due:
+            st.last_sample_t = now
+            ep_counts: dict[str, int] = defaultdict(int)
+            for _, _, ep in window:
+                ep_counts[ep] += 1
+            st.entropy.update(shannon_entropy(ep_counts))
+            st.rate.update(len(window) / self._window_seconds)
         st.update_mix(profile)
 
         self._history[agent_id].append(
