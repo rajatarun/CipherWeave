@@ -22,6 +22,15 @@ from cipherweave.exceptions import (
 )
 from cipherweave.models import PathRiskResult
 from cipherweave.profiles import CipherProfile
+from cipherweave.scoring import (
+    DEFAULT_GAMMA,
+    DEFAULT_HOP_BOUND,
+    aggregate_path_risk,
+    combine,
+    compliance_floor,
+    justify,
+    profile_for_score,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +266,49 @@ def _profile_from_risk(
     )
 
 
+def _score(
+    seeds: list[str],
+    adjacency: dict[str, list[str]],
+    attributes: dict[str, dict],
+    agent_id: str,
+    asset_id: str | None,
+    endpoint_id: str,
+    classification: str,
+    hop_bound: int,
+    gamma: float,
+) -> PathRiskResult:
+    """Run Algorithm 1 over a local adjacency map and apply the raise-only operators."""
+    agg = aggregate_path_risk(
+        seeds,
+        neighbors=lambda n: adjacency.get(n, ()),
+        attributes=lambda n: attributes.get(n, {}),
+        hop_bound=hop_bound,
+        gamma=gamma,
+    )
+    from_score = profile_for_score(agg.risk_score)
+    floor = compliance_floor(agg.regulations)
+    final = combine(from_score, floor)
+
+    path_nodes = [f"Agent:{agent_id}"]
+    if asset_id:
+        path_nodes.append(f"DataAsset:{asset_id}")
+    path_nodes.append(f"Endpoint:{endpoint_id}")
+
+    return PathRiskResult(
+        path_nodes=path_nodes,
+        regulations_crossed=agg.regulations,
+        threat_proximity=agg.threat_proximity,
+        data_classification=classification,
+        recommended_profile=final,
+        risk_score=agg.risk_score,
+        justification=justify(agg, floor, final),
+        evidence_mass=agg.evidence_mass,
+        evidence_trail=agg.explain(),
+        nodes_visited=agg.visited_nodes,
+        compliance_floor=floor,
+    )
+
+
 class RiskGraph:
     """Graph-based path risk scoring using Memgraph (Bolt/Cypher).
 
@@ -337,16 +389,71 @@ class RiskGraph:
                 pass
         logger.info("Memgraph schema initialized")
 
+    _NEIGHBOR_CYPHER = """
+    UNWIND $frontier AS fid
+    MATCH (a)-[]-(b)
+    WHERE coalesce(a.agent_id, a.asset_id, a.endpoint_id, a.reg_id, a.indicator_id) = fid
+    RETURN fid AS src,
+           coalesce(b.agent_id, b.asset_id, b.endpoint_id, b.reg_id, b.indicator_id) AS dst,
+           labels(b)[0] AS type,
+           b.name AS name,
+           b.classification AS classification,
+           b.vpc_internal AS vpc_internal,
+           b.severity AS severity,
+           b.weight AS weight
+    """
+
+    async def _fetch_neighborhood(
+        self, seeds: list[str], hop_bound: int
+    ) -> tuple[dict[str, list[str]], dict[str, dict]]:
+        """Level-synchronous BFS prefetch: one query per level, at most `hop_bound` levels.
+
+        Pulling the bounded neighborhood into a local adjacency map lets the same
+        `aggregate_path_risk` (Algorithm 1) run over Memgraph and over the in-memory
+        test double, rather than maintaining two different scoring paths.
+        """
+        adjacency: dict[str, list[str]] = {}
+        attributes: dict[str, dict] = {}
+        frontier = [s for s in seeds if s]
+        visited: set[str] = set(frontier)
+
+        for _ in range(hop_bound):
+            if not frontier:
+                break
+            rows = await self._execute(self._NEIGHBOR_CYPHER, {"frontier": frontier})
+            nxt: list[str] = []
+            for row in rows:
+                src, dst = row.get("src"), row.get("dst")
+                if not src or not dst:
+                    continue
+                adjacency.setdefault(src, []).append(dst)
+                if dst not in attributes:
+                    attributes[dst] = {
+                        "type": row.get("type"),
+                        "name": row.get("name"),
+                        "classification": row.get("classification"),
+                        "vpc_internal": row.get("vpc_internal"),
+                        "severity": row.get("severity"),
+                        "weight": row.get("weight"),
+                    }
+                if dst not in visited:
+                    visited.add(dst)
+                    nxt.append(dst)
+            frontier = nxt
+        return adjacency, attributes
+
     async def get_path_risk(
         self,
         agent_id: str,
         destination_url: str,
         data_tags: list[str],
+        hop_bound: int = DEFAULT_HOP_BOUND,
+        gamma: float = DEFAULT_GAMMA,
     ) -> PathRiskResult:
-        """Compute cipher profile and risk score for an agent→endpoint path."""
-        # 1. Find matching endpoint
+        """Score an agent->endpoint flow by bounded evidence aggregation (Eq. 1/2)."""
         ep_rows = await self._execute(
-            "MATCH (e:Endpoint {url: $url}) RETURN e.endpoint_id AS endpoint_id, e.vpc_internal AS vpc_internal",
+            "MATCH (e:Endpoint {url: $url}) RETURN e.endpoint_id AS endpoint_id, "
+            "e.vpc_internal AS vpc_internal",
             {"url": destination_url},
         )
         if not ep_rows:
@@ -354,64 +461,28 @@ class RiskGraph:
         endpoint_id = ep_rows[0]["endpoint_id"]
         vpc_internal = bool(ep_rows[0].get("vpc_internal", False))
 
-        # 2. Find DataAssets accessed by this agent that are stored at this endpoint
         asset_rows = await self._execute(
             """
             MATCH (a:Agent {agent_id: $agent_id})-[:ACCESSES]->(d:DataAsset)-[:STORED_AT]->(e:Endpoint {endpoint_id: $ep_id})
-            RETURN d.asset_id AS asset_id, d.classification AS classification, d.tags AS tags
+            RETURN d.asset_id AS asset_id, d.classification AS classification
             LIMIT 1
             """,
             {"agent_id": agent_id, "ep_id": endpoint_id},
         )
+        asset_id = asset_rows[0].get("asset_id") if asset_rows else None
+        classification = (asset_rows[0].get("classification") or "INTERNAL") if asset_rows else "INTERNAL"
 
-        classification = "INTERNAL"
-        asset_id = None
-        if asset_rows:
-            classification = asset_rows[0].get("classification", "INTERNAL")
-            asset_id = asset_rows[0].get("asset_id")
+        seeds = [x for x in (agent_id, asset_id, endpoint_id) if x]
+        adjacency, attributes = await self._fetch_neighborhood(seeds, hop_bound)
 
-        # 3. Find regulations governing data assets on this path
-        reg_rows = await self._execute(
-            """
-            MATCH (a:Agent {agent_id: $agent_id})-[:ACCESSES]->(d:DataAsset)-[:GOVERNED_BY]->(r:Regulation)
-            WHERE EXISTS { (d)-[:STORED_AT]->(:Endpoint {endpoint_id: $ep_id}) }
-            RETURN DISTINCT r.name AS reg_name
-            """,
-            {"agent_id": agent_id, "ep_id": endpoint_id},
-        )
-        regulations = [row["reg_name"] for row in reg_rows]
-
-        # 4. Find direct threats on the target endpoint (threat_proximity=1)
-        threat_rows = await self._execute(
-            """
-            MATCH (e:Endpoint {endpoint_id: $ep_id})-[:EXPOSED_TO]->(t:ThreatIndicator)
-            RETURN count(t) AS threat_count
-            """,
-            {"ep_id": endpoint_id},
-        )
-        direct_threats = threat_rows[0]["threat_count"] if threat_rows else 0
-        threat_proximity = 1 if direct_threats > 0 else 999
-
-        # 5. Build path nodes list for audit trail
-        path_nodes = [f"Agent:{agent_id}"]
+        # Seed attributes are known locally and are not re-fetched.
+        attributes[agent_id] = {"type": "Agent"}
+        attributes[endpoint_id] = {"type": "Endpoint", "vpc_internal": vpc_internal}
         if asset_id:
-            path_nodes.append(f"DataAsset:{asset_id}")
-        path_nodes.append(f"Endpoint:{endpoint_id}")
+            attributes[asset_id] = {"type": "DataAsset", "classification": classification}
 
-        # 6. Determine profile via routing table
-        profile, risk_score, justification = _profile_from_risk(
-            regulations, threat_proximity, classification, vpc_internal
-        )
-
-        return PathRiskResult(
-            path_nodes=path_nodes,
-            regulations_crossed=regulations,
-            threat_proximity=threat_proximity,
-            data_classification=classification,
-            recommended_profile=profile,
-            risk_score=risk_score,
-            justification=justification,
-        )
+        return _score(seeds, adjacency, attributes, agent_id, asset_id, endpoint_id,
+                      classification, hop_bound, gamma)
 
     async def validate_agent_authorization(
         self,
@@ -527,6 +598,12 @@ class MockRiskGraph(RiskGraph):
         self._regulations: dict[str, dict[str, Any]] = {}
         self._threats: dict[str, dict[str, Any]] = {}
         self._edges: list[tuple[str, str, str]] = []  # (from_id, rel, to_id)
+        # Adjacency indexes. The previous implementation rescanned the whole edge
+        # list per lookup, making a single decision quadratic in graph size; these
+        # make neighbour lookup O(degree).
+        self._adj_typed: dict[tuple[str, str], list[str]] = {}
+        self._adj_undirected: dict[str, list[str]] = {}
+        self._url_index: dict[str, str] = {}
 
     async def connect(self) -> None:
         logger.info("MockRiskGraph connected (in-memory)")
@@ -559,66 +636,70 @@ class MockRiskGraph(RiskGraph):
             self._threats[t["indicator_id"]] = t
         for edge in edges or []:
             self._edges.append(edge)
+            self._index_edge(*edge)
+        for e in endpoints or []:
+            self._url_index[e["url"]] = e["endpoint_id"]
+
+    def _index_edge(self, frm: str, rel: str, to: str) -> None:
+        self._adj_typed.setdefault((frm, rel), []).append(to)
+        self._adj_undirected.setdefault(frm, []).append(to)
+        self._adj_undirected.setdefault(to, []).append(frm)
+
+    def _node_attrs(self, node_id: str) -> dict[str, Any]:
+        """Uniform attribute view over the heterogeneous in-memory stores."""
+        if node_id in self._assets:
+            a = self._assets[node_id]
+            return {"type": "DataAsset", "classification": a.get("classification", "INTERNAL")}
+        if node_id in self._endpoints:
+            e = self._endpoints[node_id]
+            return {"type": "Endpoint", "vpc_internal": e.get("vpc_internal", False)}
+        if node_id in self._regulations:
+            r = self._regulations[node_id]
+            return {"type": "Regulation", "name": r.get("name", node_id), "weight": r.get("weight")}
+        if node_id in self._threats:
+            t = self._threats[node_id]
+            return {"type": "ThreatIndicator", "name": t.get("name", node_id),
+                    "severity": t.get("severity"), "weight": t.get("weight")}
+        if node_id in self._agents:
+            return {"type": "Agent"}
+        return {}
 
     def _neighbors(self, node_id: str, rel: str) -> list[str]:
-        return [to for (frm, r, to) in self._edges if frm == node_id and r == rel]
+        return self._adj_typed.get((node_id, rel), [])
 
     async def get_path_risk(
         self,
         agent_id: str,
         destination_url: str,
         data_tags: list[str],
+        hop_bound: int = DEFAULT_HOP_BOUND,
+        gamma: float = DEFAULT_GAMMA,
     ) -> PathRiskResult:
-        ep = next((e for e in self._endpoints.values() if e["url"] == destination_url), None)
-        if ep is None:
+        endpoint_id = self._url_index.get(destination_url)
+        if endpoint_id is None:
             raise PathNotFoundError(agent_id, destination_url)
 
-        endpoint_id = ep["endpoint_id"]
-        vpc_internal = ep.get("vpc_internal", False)
-
-        # Find data assets the agent accesses stored at this endpoint
-        accessed_asset_ids = self._neighbors(agent_id, "ACCESSES")
-        classification = "INTERNAL"
         asset_id = None
-        for aid in accessed_asset_ids:
-            stored_at = self._neighbors(aid, "STORED_AT")
-            if endpoint_id in stored_at:
+        classification = "INTERNAL"
+        for aid in self._neighbors(agent_id, "ACCESSES"):
+            if endpoint_id in self._neighbors(aid, "STORED_AT"):
                 asset_id = aid
                 classification = self._assets.get(aid, {}).get("classification", "INTERNAL")
                 break
 
-        # Regulations
-        regulations: list[str] = []
-        for aid in accessed_asset_ids:
-            stored_at = self._neighbors(aid, "STORED_AT")
-            if endpoint_id in stored_at:
-                for rid in self._neighbors(aid, "GOVERNED_BY"):
-                    reg = self._regulations.get(rid, {})
-                    if reg.get("name"):
-                        regulations.append(reg["name"])
+        seeds = [x for x in (agent_id, asset_id, endpoint_id) if x]
+        return _score(seeds, self._adj_undirected, self._node_attrs_map(), agent_id,
+                      asset_id, endpoint_id, classification, hop_bound, gamma)
 
-        # Threat proximity
-        exposed_threats = self._neighbors(endpoint_id, "EXPOSED_TO")
-        threat_proximity = 1 if exposed_threats else 999
+    def _node_attrs_map(self) -> dict[str, dict[str, Any]]:
+        """Lazy attribute view presented as a mapping for the shared scorer."""
 
-        path_nodes = [f"Agent:{agent_id}"]
-        if asset_id:
-            path_nodes.append(f"DataAsset:{asset_id}")
-        path_nodes.append(f"Endpoint:{endpoint_id}")
+        class _View(dict):
+            def __init__(self, owner): self._owner = owner
+            def get(self, key, default=None):  # type: ignore[override]
+                return self._owner._node_attrs(key) or (default if default is not None else {})
 
-        profile, risk_score, justification = _profile_from_risk(
-            regulations, threat_proximity, classification, vpc_internal
-        )
-
-        return PathRiskResult(
-            path_nodes=path_nodes,
-            regulations_crossed=regulations,
-            threat_proximity=threat_proximity,
-            data_classification=classification,
-            recommended_profile=profile,
-            risk_score=risk_score,
-            justification=justification,
-        )
+        return _View(self)
 
     async def validate_agent_authorization(
         self,
@@ -667,6 +748,7 @@ class MockRiskGraph(RiskGraph):
             edge = (asset_id, "GOVERNED_BY", reg_id)
             if edge not in self._edges:
                 self._edges.append(edge)
+                self._index_edge(*edge)
 
         for frm, rel, to in [
             (agent_id, "ACCESSES", asset_id),
@@ -675,5 +757,7 @@ class MockRiskGraph(RiskGraph):
         ]:
             if (frm, rel, to) not in self._edges:
                 self._edges.append((frm, rel, to))
+                self._index_edge(frm, rel, to)
 
+        self._url_index[destination_url] = endpoint_id
         return endpoint_id

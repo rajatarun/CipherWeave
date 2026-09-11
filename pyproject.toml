@@ -16,6 +16,13 @@ dependencies = [
     "boto3>=1.34.0",
     "python-dotenv>=1.0.0",
     "mangum>=0.17.0",          # ASGI adapter for AWS Lambda + API Gateway
+    # ML-KEM-768 backend for the QUANTUM_SAFE profile. This is a REQUIRED
+    # dependency, not optional: without it CipherJanitor raises
+    # PostQuantumUnavailableError rather than silently issuing a non-PQ key.
+    # An earlier revision fell back to os.urandom() stubs, which meant the two
+    # peers derived different secrets and the strongest profile provided no
+    # post-quantum protection at all.
+    "liboqs-python>=0.10.0",
 ]
 
 [project.optional-dependencies]
