@@ -15,15 +15,16 @@ import fastmcp
 from cipherweave.cipher_janitor import CipherJanitor
 from cipherweave.config import settings
 from cipherweave.drift_detector import DriftDetector
-from cipherweave.exceptions import (
+from cipherweave.exceptions import (  # noqa: F401 — re-exported so FastMCP surfaces them as tool errors
     CipherWeaveError,
-    MetadataInferenceError,  # noqa: F401 — re-exported so FastMCP surfaces it as tool error
+    MetadataInferenceError,
     PathNotFoundError,
     UnauthorizedAgentError,
 )
+from cipherweave.gate_integration import decide_profile
 from cipherweave.models import EncryptionStrategy
 from cipherweave.profiles import CipherProfile
-from cipherweave.risk_engine import RiskGraph, infer_policy_from_metadata
+from cipherweave.risk_engine import RiskGraph
 
 logger = logging.getLogger(__name__)
 
@@ -73,52 +74,28 @@ async def get_encryption_strategy(
 
     start_ns = time.monotonic_ns()
     decision_id = _make_decision_id()
-    data_tags: list[str] = data_metadata.get("tags", [])
 
-    # Step 1: Resolve endpoint; JIT-register if unknown
-    endpoint_id = await _risk_graph.get_endpoint_id_for_url(destination_url)
-    if endpoint_id is None:
-        # Strict metadata validation then Bedrock inference — raises MetadataInferenceError on failure
-        classification, regulations, _, _, _ = await infer_policy_from_metadata(
-            data_metadata,
-            bedrock_client=_bedrock_client,
-            model_id=settings.bedrock_inference_model_id,
-        )
-        endpoint_id = await _risk_graph.upsert_jit_path(
-            agent_id, destination_url, classification, regulations
-        )
-        logger.info(
-            "JIT registered: agent=%s url=%s classification=%s regs=%s",
-            agent_id, destination_url, classification, regulations,
-        )
-
-    try:
-        await _risk_graph.validate_agent_authorization(agent_id, endpoint_id)
-    except UnauthorizedAgentError:
-        raise
-
-    # Step 2: Graph path risk
-    path_risk = await _risk_graph.get_path_risk(agent_id, destination_url, data_tags)
-
-    # Step 3: Drift detection
-    is_anomalous, alert = await _drift_detector.detect_anomaly(
+    # Steps 1-3 — endpoint resolution (JIT-registering an unknown one), authorization,
+    # Eq. 1/2 aggregation with the compliance floor, and the drift override, joined
+    # over the profile lattice. This is the same call the propose-time gate client
+    # makes (`gate_integration.required_profile`), so a channel the gate binds can
+    # never be weaker than the one this tool would have issued for the same flow.
+    decision = await decide_profile(
         agent_id=agent_id,
-        requested_profile=path_risk.recommended_profile,
-        data_tags=data_tags,
-        endpoint_id=endpoint_id,
+        destination_url=destination_url,
+        data_metadata=data_metadata,
+        risk_graph=_risk_graph,
+        drift_detector=_drift_detector,
+        bedrock_client=_bedrock_client,
     )
-
-    # Apply fail-secure override if anomalous
-    final_profile = (
-        CipherProfile.QUANTUM_SAFE
-        if is_anomalous
-        else path_risk.recommended_profile
-    )
-    override_applied = is_anomalous
+    endpoint_id = decision.endpoint_id or ""
+    final_profile = decision.profile
+    is_anomalous = decision.drift_detected
+    alert = decision.alert
 
     # Step 4: Derive HKDF key
     salt = os.urandom(32)
-    info_string = _build_info_string(agent_id, endpoint_id, path_risk.path_nodes)
+    info_string = _build_info_string(agent_id, endpoint_id, list(decision.path_nodes))
     info_bytes = info_string.encode()
 
     msk = await _cipher_janitor.get_master_secret()
@@ -137,7 +114,7 @@ async def get_encryption_strategy(
         agent_id=agent_id,
         profile=final_profile,
         endpoint_id=endpoint_id,
-        risk_score=path_risk.risk_score,
+        risk_score=decision.risk_score,
     )
 
     elapsed_ms = (time.monotonic_ns() - start_ns) / 1_000_000
@@ -159,26 +136,18 @@ async def get_encryption_strategy(
         kdf_algorithm=final_profile.kdf_label(),
         salt_b64=base64.b64encode(salt).decode(),
         info_string=info_string,
-        regulations_crossed=path_risk.regulations_crossed,
-        threat_proximity=path_risk.threat_proximity,
-        path_nodes=path_risk.path_nodes,
-        risk_score=path_risk.risk_score,
-        justification=(
-            f"[DRIFT OVERRIDE] {path_risk.justification}"
-            if override_applied and not is_anomalous
-            else (
-                f"[ANOMALY DETECTED — QUANTUM_SAFE enforced] {path_risk.justification}"
-                if override_applied
-                else path_risk.justification
-            )
-        ),
+        regulations_crossed=list(decision.regulations_crossed),
+        threat_proximity=decision.threat_proximity,
+        path_nodes=list(decision.path_nodes),
+        risk_score=decision.risk_score,
+        justification=decision.justification,
         cost_per_operation_usd=final_profile.cost_per_operation_usd(),
         ttl_seconds=final_profile.ttl_seconds(),
         hybrid_keypair=hybrid_public,
         audit_log={
             "decision_made_by": "CipherJanitor",
             "drift_detected": is_anomalous,
-            "override_applied": override_applied,
+            "override_applied": is_anomalous,
             "alert_id": alert.alert_id if alert else None,
             "alert_type": alert.alert_type if alert else None,
             "latency_ms": round(elapsed_ms, 3),
