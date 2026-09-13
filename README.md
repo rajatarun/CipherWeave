@@ -253,6 +253,39 @@ JIT-registered nodes carry `jit_registered: true` so they can be audited or prun
 
 ---
 
+## Gate Integration (mcp-observatory)
+
+CipherWeave decides *how* a flow must be protected; mcp-observatory's
+propose/commit gate decides *whether* the call runs. `gate_integration` is the
+seam — a gate consumer asks for the required profile while it is scoring a
+prospective call, and binds the answer into the HMAC-signed commit token so the
+executor cannot downgrade the transport between approval and execution.
+
+```python
+from cipherweave.gate_integration import required_profile
+
+decision = required_profile(
+    "agent-001",
+    "https://hipaa.store/api",
+    classification="RESTRICTED",
+    regulations=["PHI"],
+)
+decision.token_value   # "QUANTUM_SAFE" -> token payload field required_cipher_profile
+decision.justification # why, for the audit record
+decision.fail_secure   # True when this is the catch-all, not the graph's answer
+```
+
+The client reuses the same decision path as the MCP tool, so the two can never
+disagree about a flow, and every failure mode — unreachable graph, unknown
+agent, unclassifiable metadata, timeout, internal defect — returns
+`QUANTUM_SAFE` rather than raising or omitting the requirement (ADR-001).
+
+- `docs/gate-integration.md` — the contract: token field, commit-side check, the
+  `channel_below_required_profile` rejection reason, and the monotonicity argument.
+- `docs/gate-integration-patch.md` — the ready-to-apply observatory-side patch.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |

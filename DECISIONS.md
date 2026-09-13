@@ -215,3 +215,19 @@ FastMCP 3.x uses contextvars internally. Lifespan `__aenter__()` tokens must be 
 4. Enters and exits the FastMCP lifespan within a single coroutine invocation
 
 **Trade-off**: The custom adapter must be maintained if FastMCP's ASGI interface changes. It covers only API GW HTTP v2 (payload format 2.0) — REST API (v1) events are not supported.
+
+---
+
+## ADR-018: Gate Integration — Profile Decided at Propose Time, Bound Under the Signature
+
+**Decision**: `src/cipherweave/gate_integration.py` exposes the decision path to mcp-observatory's propose/commit gate. The gate obtains the required `CipherProfile` while it scores a prospective call and binds it into the HMAC-signed commit token as `required_cipher_profile`; the commit verifier rejects an executor whose channel is weaker, with the distinct reason `channel_below_required_profile`. The contract is `docs/gate-integration.md`; the observatory-side patch is specified in `docs/gate-integration-patch.md`.
+
+**One decision path, not two**: `decide_profile()` *is* the policy — endpoint resolution with JIT registration, authorization, Eq. 1/2 aggregation, compliance floor, drift override — and `server.get_encryption_strategy` calls it and derives key material from its result. A second implementation for gate callers would be a second thing to keep correct, and the first divergence would be invisible: the gate would authorize a channel the MCP tool would not have issued for the same flow. A test asserts the two agree.
+
+**Why propose time and not commit time**: the token is the only artifact that travels from the authorization decision to the side effect, and it is signed. Deciding at commit would mean the executor chooses when to ask, which is the thing being constrained.
+
+**What the client deliberately does not do**: it derives no key material (a proposal may never be committed; burning a salt per proposal is waste and grows the reuse ledger for nothing) and it writes no history to the `DriftDetector` (only a call that actually executed is an observation about the agent's behaviour — logging proposals would let an agent move its own baseline by proposing).
+
+**Fail-secure, and not optional**: every failure — unreachable graph, unknown or unauthorized agent, unclassifiable metadata, timeout, defect under scoring — returns `QUANTUM_SAFE` with `fail_secure=True` and the cause recorded (ADR-001). The rejected alternative is to omit the field on failure, which would make "make CipherWeave unreachable" the cheapest downgrade attack available.
+
+**Trade-off**: the channel value checked at commit is reported by the executor, so the binding constrains a claim rather than measuring the wire. What it buys is that the requirement is decided by policy rather than by the executor, is immutable between the two phases (any edit is a MAC forgery), and is recorded — so a downgrade is either refused or attributable. Verified transport is out of scope, as key compromise is out of scope for the gate's own P3/P4.
