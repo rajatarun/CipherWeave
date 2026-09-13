@@ -44,13 +44,18 @@ This document records deliberate design choices, trade-offs, and assumptions mad
 
 ---
 
-## ADR-005: Memory Sanitation — Best-Effort via ctypes
+## ADR-005: Memory Sanitation — Mutable Buffers Only (supersedes the ctypes approach)
 
-**Decision**: `_zero_bytes()` attempts to overwrite the internal buffer of Python `bytes` objects using `ctypes.memmove`. For `bytearray`, it uses index assignment (reliable).
+**Decision**: `_zero_bytes()` overwrites `bytearray` buffers by index assignment and returns `True`. For immutable `bytes` it does nothing and returns `False`. Secret material is carried as `bytearray` from creation to consumption: `CipherJanitor.get_master_secret()` returns a `bytearray`, and `derive_key()` erases it after expansion.
 
-**Rationale**: Python's immutable `bytes` objects cannot be zeroed via normal Python code. The `ctypes` approach targets the CPython object layout, which is an implementation detail. We document this as best-effort.
+**What changed and why (SEC-6)**: The original implementation overwrote the internal buffer of a `bytes` object with `ctypes.memmove(id(buf) + 33, ...)`. Two defects, neither of which is fixable by tuning the constant:
 
-**Trade-off**: This is CPython-specific and may break on PyPy or future CPython versions. The safer alternative is to use `bytearray` throughout the key derivation pipeline, converting to `bytes` only at API boundaries. Refactoring to use `bytearray` everywhere is a v0.2 target.
+1. **33 is not an interface.** It is the offset of `ob_sval` in one particular CPython build. Debug builds and future versions lay the object out differently, and no other interpreter shares the layout at all. A wrong offset does not raise — the write lands on adjacent heap memory and corrupts unrelated objects. The `try/except` around it cannot catch that, because nothing throws.
+2. **`bytes` objects are shared.** Interning and constant folding mean the buffer being "erased" may be a literal, or a value another live reference still reads. Zeroing it corrupts state that belongs to someone else.
+
+**What it costs**: a `bytes` secret is now demonstrably not erased, where before it was *claimed* to be erased and sometimes was. That is a smaller loss than it looks. A best-effort scrub was never a defence against an adversary who can read process memory; it only shortens the window in which a *copy the caller has already released* is still recoverable. Against that marginal benefit stood a real chance of silent heap corruption, so the honest no-op wins. Buffers we create ourselves — the master secret, the concatenated hybrid shared secret — are `bytearray` and are erased for real, which is the part that was worth keeping.
+
+**Residual exposure, stated plainly**: values produced by libraries we do not control stay unerasable. `KMS GenerateDataKey` returns `bytes` (and boto3 keeps its own reference); `HKDF.derive()` returns the OKM as `bytes`; the X25519 and ML-KEM backends return their shared secrets as `bytes`. Those are copied into a `bytearray` where we need to keep working with them, but the originals remain in the heap until garbage collected. Eliminating that requires the key-derivation stack itself to expose mutable output buffers, which `cryptography` does not.
 
 ---
 

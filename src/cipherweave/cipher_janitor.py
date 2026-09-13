@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import gc
 import hashlib
 import logging
@@ -36,20 +35,39 @@ _HASH_MAP: dict[str, Any] = {
 }
 
 
-def _zero_bytes(buf: bytes | bytearray) -> None:
-    """Overwrite a bytes/bytearray buffer with zeros in-place via ctypes."""
+def _zero_bytes(buf: bytes | bytearray) -> bool:
+    """Overwrite a *mutable* buffer with zeros in place. Returns True if it did.
+
+    Only `bytearray` can be erased honestly, so that is the only thing this
+    function touches. An immutable `bytes` object is left alone and False is
+    returned, which is why secret material is carried as `bytearray` from the
+    point it is created (`get_master_secret`) to the point it is consumed.
+
+    Why the previous implementation was removed (SEC-6). It wrote over a `bytes`
+    object with `ctypes.memmove(id(buf) + 33, ...)`. Two things are wrong with
+    that, and neither is fixable by adjusting the constant:
+
+    * 33 is the offset of `ob_sval` in one particular CPython build. It is not
+      part of any interface, it differs across builds (debug builds add fields
+      ahead of it) and it is meaningless on any other interpreter. When it is
+      wrong the write does not fail — it silently lands on whatever object memory
+      follows, corrupting unrelated heap state.
+    * `bytes` objects are shared. Interning and constant folding mean the buffer
+      being "erased" may be a literal that other code still reads, and any other
+      live reference to the same object sees the zeros. Erasing a value that
+      someone else owns is a correctness bug committed in the name of security.
+
+    Refusing to do it costs nothing that the old code actually delivered: a
+    best-effort scrub of a copy the caller no longer holds was never a defence
+    against an attacker who can read process memory, and the real defence —
+    holding secrets in a buffer that can be overwritten — is what replaces it.
+    See ADR-005.
+    """
     if isinstance(buf, bytearray):
         for i in range(len(buf)):
             buf[i] = 0
-        return
-    # For immutable bytes objects, we target the internal buffer via ctypes.
-    # This is a best-effort operation; CPython implementation detail.
-    try:
-        size = len(buf)
-        if size > 0:
-            ctypes.memmove(id(buf) + 33, b"\x00" * size, size)
-    except Exception:
-        pass  # Sanitization is best-effort; log but don't crash
+        return True
+    return False
 
 
 class CipherJanitor:
@@ -63,24 +81,30 @@ class CipherJanitor:
         self._ctx_buffers: list[bytes | bytearray] = []  # registered for secure_context cleanup
         self._gc_counter: int = 0  # counts derivations between full GC runs
 
-    async def get_master_secret(self) -> bytes:
-        """Fetch a fresh 32-byte master secret from KMS (or local mock)."""
+    async def get_master_secret(self) -> bytearray:
+        """Fetch a fresh 32-byte master secret from KMS (or local mock).
+
+        Returned as a `bytearray`, not `bytes`, so that `_zero_bytes` can actually
+        erase it after derivation (ADR-005). The KMS response itself hands us an
+        immutable `bytes` that boto3 still holds a reference to; that copy cannot
+        be erased from Python, which is the residual exposure this design accepts.
+        """
         if self._kms_client is None:
             # Local dev: deterministic mock via os.urandom
-            return os.urandom(32)
+            return bytearray(os.urandom(32))
         try:
             response = self._kms_client.generate_data_key(
                 KeyId=self._master_key_id,
                 NumberOfBytes=32,
             )
             plaintext: bytes = response["Plaintext"]
-            return plaintext
+            return bytearray(plaintext)
         except Exception as exc:
             raise KMSError(f"KMS GenerateDataKey failed: {exc}") from exc
 
     def derive_key(
         self,
-        master_secret: bytes,
+        master_secret: bytes | bytearray,
         salt: bytes,
         info: bytes,
         profile: CipherProfile,
@@ -88,7 +112,8 @@ class CipherJanitor:
         """HKDF (RFC 5869) key derivation with salt-reuse detection.
 
         Args:
-            master_secret: 32-byte IKM from KMS.
+            master_secret: 32-byte IKM from KMS. Pass a `bytearray` if it must be
+                erased afterwards — an immutable `bytes` cannot be (ADR-005).
             salt: Fresh 32-byte random salt — MUST be unique per call.
             info: Context string encoded as bytes.
             profile: Target CipherProfile determining key length and hash.
@@ -114,9 +139,10 @@ class CipherJanitor:
             salt=salt,
             info=info,
         )
-        okm = hkdf.derive(master_secret)
+        okm = hkdf.derive(bytes(master_secret))
 
-        # Zero the IKM immediately after derivation
+        # Zero the IKM immediately after derivation. This is effective only for a
+        # mutable buffer; a caller who passes `bytes` keeps its secret (ADR-005).
         _zero_bytes(master_secret)
         # Gen-0 collection is < 0.001ms; full gc.collect() runs every _GC_INTERVAL calls
         gc.collect(0)
@@ -170,11 +196,13 @@ class CipherJanitor:
 
         mlkem_shared = _mlkem_decapsulate(mlkem_private, mlkem_ciphertext)
 
-        combined = x25519_shared + mlkem_shared
+        combined = bytearray(x25519_shared) + bytearray(mlkem_shared)
         digest = hashlib.sha512(combined).digest()
 
-        _zero_bytes(x25519_shared)
-        _zero_bytes(mlkem_shared)
+        # Only the buffer we own is erasable. `x25519_shared` and `mlkem_shared`
+        # are immutable `bytes` handed back by the crypto backends, which still
+        # hold their own references; calling `_zero_bytes` on them would be a
+        # no-op dressed up as a countermeasure, so it is not called (ADR-005).
         _zero_bytes(combined)
 
         return digest

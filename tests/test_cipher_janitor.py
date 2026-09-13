@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 import pytest
@@ -111,21 +112,43 @@ def test_derive_key_quantum_safe(cipher_janitor: CipherJanitor) -> None:
 
 
 def test_memory_sanitation() -> None:
-    """Verify best-effort IKM zeroing does not crash and CipherJanitor completes normally."""
+    """A bytearray IKM is genuinely erased by derive_key; the OKM is unaffected."""
     janitor = CipherJanitor(kms_client=None, master_key_id="local")
     msk = bytearray(os.urandom(32))
-    original = bytes(msk)
+    assert any(b != 0 for b in msk)
 
     salt = os.urandom(32)
     info = b"cipherweave:v1:mem-test:ep:hash:111"
-    # Pass as bytes (copy of msk)
-    msk_bytes = bytes(msk)
-    result = janitor.derive_key(msk_bytes, salt, info, CipherProfile.BALANCED)
+    result = janitor.derive_key(msk, salt, info, CipherProfile.BALANCED)
 
-    # OKM must be present and correct length
     assert len(result.okm) == 32
-    # Zero the bytearray manually and confirm
-    _zero_bytes(msk)
+    assert all(b == 0 for b in msk), "derive_key must zero a mutable IKM in place"
+
+
+def test_zero_bytes_erases_bytearray_and_refuses_bytes() -> None:
+    """SEC-6: zeroing is real for bytearray and an explicit no-op for bytes.
+
+    The `bytes` branch used to reach into the CPython object layout with
+    `ctypes.memmove(id(buf) + 33, ...)`. It now reports that it did nothing
+    rather than corrupting memory that may be shared (ADR-005).
+    """
+    mutable = bytearray(b"\xff" * 16)
+    assert _zero_bytes(mutable) is True
+    assert all(b == 0 for b in mutable)
+
+    immutable = b"\xff" * 16
+    assert _zero_bytes(immutable) is False
+    assert immutable == b"\xff" * 16
+
+
+def test_master_secret_is_erasable() -> None:
+    """get_master_secret hands back a buffer that can actually be wiped."""
+    janitor = CipherJanitor(kms_client=None, master_key_id="local")
+    msk = asyncio.run(janitor.get_master_secret())
+
+    assert isinstance(msk, bytearray)
+    assert len(msk) == 32
+    assert _zero_bytes(msk) is True
     assert all(b == 0 for b in msk)
 
 
