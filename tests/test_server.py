@@ -107,13 +107,44 @@ async def test_get_encryption_strategy_salt_is_base64() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_encryption_strategy_unknown_url_raises() -> None:
-    """Unknown destination URL raises PathNotFoundError."""
-    from cipherweave.exceptions import PathNotFoundError
+async def test_get_encryption_strategy_unknown_url_is_jit_registered(
+    mock_graph: MockRiskGraph,
+) -> None:
+    """An unknown destination is registered, not refused (ADR-016).
 
-    with pytest.raises(PathNotFoundError):
+    This test previously asserted PathNotFoundError. That stopped being the
+    behaviour when JIT registration landed: an unknown agent/endpoint pair is
+    seeded from validated metadata and then scored normally. The guarantee that
+    survives -- and that this test now pins -- is the fail-secure one: a path
+    with no history is new, so the drift detector's cold-start rule forces
+    QUANTUM_SAFE (ADR-001).
+    """
+    url = "https://completely.unknown/endpoint"
+    assert await mock_graph.get_endpoint_id_for_url(url) is None
+
+    result = await get_encryption_strategy(
+        agent_id="agent-001",
+        data_metadata={"tags": [], "classification": "INTERNAL"},
+        destination_url=url,
+    )
+
+    assert result["cipher_profile"] == "QUANTUM_SAFE"
+    assert result["audit_log"]["drift_detected"] is True
+    assert await mock_graph.get_endpoint_id_for_url(url) is not None
+
+
+@pytest.mark.asyncio
+async def test_get_encryption_strategy_rejects_unusable_metadata() -> None:
+    """Metadata that cannot be validated is refused rather than guessed.
+
+    The refusal that replaces the old PathNotFoundError: CipherWeave will not
+    register a path it cannot classify.
+    """
+    from cipherweave.exceptions import MetadataInferenceError
+
+    with pytest.raises(MetadataInferenceError):
         await get_encryption_strategy(
             agent_id="agent-001",
-            data_metadata={"tags": [], "classification": "INTERNAL"},
-            destination_url="https://completely.unknown/endpoint",
+            data_metadata={"tags": []},  # no classification
+            destination_url="https://also.unknown/endpoint",
         )

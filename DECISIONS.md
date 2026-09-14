@@ -44,13 +44,18 @@ This document records deliberate design choices, trade-offs, and assumptions mad
 
 ---
 
-## ADR-005: Memory Sanitation — Best-Effort via ctypes
+## ADR-005: Memory Sanitation — Mutable Buffers Only (supersedes the ctypes approach)
 
-**Decision**: `_zero_bytes()` attempts to overwrite the internal buffer of Python `bytes` objects using `ctypes.memmove`. For `bytearray`, it uses index assignment (reliable).
+**Decision**: `_zero_bytes()` overwrites `bytearray` buffers by index assignment and returns `True`. For immutable `bytes` it does nothing and returns `False`. Secret material is carried as `bytearray` from creation to consumption: `CipherJanitor.get_master_secret()` returns a `bytearray`, and `derive_key()` erases it after expansion.
 
-**Rationale**: Python's immutable `bytes` objects cannot be zeroed via normal Python code. The `ctypes` approach targets the CPython object layout, which is an implementation detail. We document this as best-effort.
+**What changed and why (SEC-6)**: The original implementation overwrote the internal buffer of a `bytes` object with `ctypes.memmove(id(buf) + 33, ...)`. Two defects, neither of which is fixable by tuning the constant:
 
-**Trade-off**: This is CPython-specific and may break on PyPy or future CPython versions. The safer alternative is to use `bytearray` throughout the key derivation pipeline, converting to `bytes` only at API boundaries. Refactoring to use `bytearray` everywhere is a v0.2 target.
+1. **33 is not an interface.** It is the offset of `ob_sval` in one particular CPython build. Debug builds and future versions lay the object out differently, and no other interpreter shares the layout at all. A wrong offset does not raise — the write lands on adjacent heap memory and corrupts unrelated objects. The `try/except` around it cannot catch that, because nothing throws.
+2. **`bytes` objects are shared.** Interning and constant folding mean the buffer being "erased" may be a literal, or a value another live reference still reads. Zeroing it corrupts state that belongs to someone else.
+
+**What it costs**: a `bytes` secret is now demonstrably not erased, where before it was *claimed* to be erased and sometimes was. That is a smaller loss than it looks. A best-effort scrub was never a defence against an adversary who can read process memory; it only shortens the window in which a *copy the caller has already released* is still recoverable. Against that marginal benefit stood a real chance of silent heap corruption, so the honest no-op wins. Buffers we create ourselves — the master secret, the concatenated hybrid shared secret — are `bytearray` and are erased for real, which is the part that was worth keeping.
+
+**Residual exposure, stated plainly**: values produced by libraries we do not control stay unerasable. `KMS GenerateDataKey` returns `bytes` (and boto3 keeps its own reference); `HKDF.derive()` returns the OKM as `bytes`; the X25519 and ML-KEM backends return their shared secrets as `bytes`. Those are copied into a `bytearray` where we need to keep working with them, but the originals remain in the heap until garbage collected. Eliminating that requires the key-derivation stack itself to expose mutable output buffers, which `cryptography` does not.
 
 ---
 
@@ -210,3 +215,19 @@ FastMCP 3.x uses contextvars internally. Lifespan `__aenter__()` tokens must be 
 4. Enters and exits the FastMCP lifespan within a single coroutine invocation
 
 **Trade-off**: The custom adapter must be maintained if FastMCP's ASGI interface changes. It covers only API GW HTTP v2 (payload format 2.0) — REST API (v1) events are not supported.
+
+---
+
+## ADR-018: Gate Integration — Profile Decided at Propose Time, Bound Under the Signature
+
+**Decision**: `src/cipherweave/gate_integration.py` exposes the decision path to mcp-observatory's propose/commit gate. The gate obtains the required `CipherProfile` while it scores a prospective call and binds it into the HMAC-signed commit token as `required_cipher_profile`; the commit verifier rejects an executor whose channel is weaker, with the distinct reason `channel_below_required_profile`. The contract is `docs/gate-integration.md`; the observatory-side patch is specified in `docs/gate-integration-patch.md`.
+
+**One decision path, not two**: `decide_profile()` *is* the policy — endpoint resolution with JIT registration, authorization, Eq. 1/2 aggregation, compliance floor, drift override — and `server.get_encryption_strategy` calls it and derives key material from its result. A second implementation for gate callers would be a second thing to keep correct, and the first divergence would be invisible: the gate would authorize a channel the MCP tool would not have issued for the same flow. A test asserts the two agree.
+
+**Why propose time and not commit time**: the token is the only artifact that travels from the authorization decision to the side effect, and it is signed. Deciding at commit would mean the executor chooses when to ask, which is the thing being constrained.
+
+**What the client deliberately does not do**: it derives no key material (a proposal may never be committed; burning a salt per proposal is waste and grows the reuse ledger for nothing) and it writes no history to the `DriftDetector` (only a call that actually executed is an observation about the agent's behaviour — logging proposals would let an agent move its own baseline by proposing).
+
+**Fail-secure, and not optional**: every failure — unreachable graph, unknown or unauthorized agent, unclassifiable metadata, timeout, defect under scoring — returns `QUANTUM_SAFE` with `fail_secure=True` and the cause recorded (ADR-001). The rejected alternative is to omit the field on failure, which would make "make CipherWeave unreachable" the cheapest downgrade attack available.
+
+**Trade-off**: the channel value checked at commit is reported by the executor, so the binding constrains a claim rather than measuring the wire. What it buys is that the requirement is decided by policy rather than by the executor, is immutable between the two phases (any edit is a MAC forgery), and is recorded — so a downgrade is either refused or attributable. Verified transport is out of scope, as key compromise is out of scope for the gate's own P3/P4.
