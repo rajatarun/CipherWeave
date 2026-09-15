@@ -265,11 +265,29 @@ jobs:
           echo "Invoking: $SEED_ARN"
           echo "Memgraph target: ${{ needs.deploy.outputs.memgraph_host }}:7687"
 
+          # SeedGraphFunction has Timeout: 300 in template.yaml, but the AWS
+          # CLI's default read timeout is 60s. A synchronous invoke therefore
+          # gave up at 60s while the function was still running, and then
+          # retried -- the observed failure ran 184s (~3 x 60s) and reported
+          # "Read timeout on endpoint URL". A seed that took longer than a
+          # minute could not succeed here however well it worked.
+          #
+          # So the read timeout must exceed the function's own, and the retries
+          # must go: this invoke is synchronous and the seed is not idempotent,
+          # so each retry starts another seed against the same graph. One
+          # attempt, waited out properly.
+          #
+          # If it still times out, the function really is hung -- check that
+          # Memgraph is reachable at the host above before touching these
+          # numbers.
+          #
           # AWS CLI v2 requires --cli-binary-format raw-in-base64-out for raw JSON payloads
-          aws lambda invoke \
+          AWS_MAX_ATTEMPTS=1 aws lambda invoke \
             --function-name "$SEED_ARN" \
             --payload '{"RequestType":"Create"}' \
             --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 360 \
+            --cli-connect-timeout 10 \
             --log-type Tail \
             --query 'LogResult' \
             --output text \
@@ -278,7 +296,9 @@ jobs:
           echo ""
           echo "=== Seed Lambda Response ==="
           if [ ! -f /tmp/seed_response.json ]; then
-            echo "❌ No response file — lambda invoke failed"
+            echo "❌ No response file — the invoke itself failed (see the aws error above)."
+            echo "   A read timeout here means the function ran past --cli-read-timeout;"
+            echo "   anything else means the call never reached Lambda."
             exit 1
           fi
           cat /tmp/seed_response.json | jq . || cat /tmp/seed_response.json
