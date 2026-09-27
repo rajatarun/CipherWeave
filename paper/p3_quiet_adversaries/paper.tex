@@ -16,7 +16,7 @@
 \title{Detecting Quiet Adversaries in Risk-Adaptive Encryption:\\ Hardening Drift Detection Against Mimicry and Low-and-Slow Traffic}
 
 \author{\IEEEauthorblockN{Tarun Raja}
-\IEEEauthorblockA{\pend{Affiliation} \\ \pend{email}}}
+\IEEEauthorblockA{Independent Researcher \\ rajatarun12@gmail.com}}
 
 \maketitle
 
@@ -33,7 +33,7 @@ Risk-adaptive encryption selects cipher strength per request~\cite{prior-cipher}
 \begin{equation}
 \delta=\max\!\big(z_H,\;z_\lambda,\;z_{\mathrm{mix}}\big)\label{eq:delta}
 \end{equation}
-exceeds $\theta$. Here $z_H$ is the standardized deviation of destination entropy, $z_\lambda$ the one-sided deviation of request rate, and $z_{\mathrm{mix}}$ the Jensen--Shannon divergence~\cite{lin1991} of the cipher-profile mix. All are computed over a trailing window against exponentially weighted moving-average (EWMA) baselines. The earlier evaluation found that attackers drawing endpoints and profiles from the victim's own history, at the victim's own rate, moved none of these channels. This paper addresses that problem, and states precisely which part of it no detector of this kind can solve.
+exceeds $\theta$. Here $z_H$ is the standardized deviation of destination entropy, $z_\lambda$ the one-sided deviation of request rate, and $z_{\mathrm{mix}}$ the Jensen--Shannon divergence~\cite{lin1991} of the cipher-profile mix. All are computed over a trailing window against exponentially weighted moving-average (EWMA) baselines. The system's earlier evaluation, in its repository~\cite{prior-cipher}, found that attackers drawing endpoints and profiles from the victim's own history, at the victim's own rate, moved none of these channels. This paper addresses that problem, and states precisely which part of it no detector of this kind can solve.
 
 \section{Related Work}
 Mimicry attacks against host-based anomaly detectors were shown by Wagner and Soto~\cite{wagner2002}. Sommer and Paxson~\cite{sommer2010} and Axelsson~\cite{axelsson2000} explain why low false-positive rates dominate the usefulness of network anomaly detection. Change detection for slow shifts traditionally uses CUSUM~\cite{page1954}. Our long-horizon channel is a windowed binomial test with a disjoint baseline. Public flow datasets such as CIC-IDS2017~\cite{sharafaldin2018} and UNSW-NB15~\cite{moustafa2015} provide recorded traffic. ML-KEM is standardized in FIPS~203~\cite{fips203}, and we measure it with the Open Quantum Safe library~\cite{stebila2016}.
@@ -193,8 +193,8 @@ The corpus is synthetic, and the v2 sensitive-data rates are assumptions. Theore
 Two longer-horizon channels close the mimicry gap for the low-and-slow, jittered low-and-slow, mimicry and downgrade attackers in our corpus, which are scripts, or are after sensitive data, or both. A disjoint baseline is what keeps the slow attacker from teaching the detector to ignore it. The attacker these channels miss is one no traffic-only detector can catch, and we prove it. Post-quantum key establishment is cheap in CPU and costs bandwidth.
 
 \begin{thebibliography}{99}
-\bibitem{prior-cipher} T.~Raja, \pend{title of the CipherWeave risk-adaptive encryption paper}, \pend{venue, year}.
-\bibitem{comp-contracts} T.~Raja, ``Not all scores are probabilities: Typed, calibrated confidence contracts for composed agent systems,'' companion paper, \pend{venue, year}.
+\bibitem{prior-cipher} T.~Raja, ``CipherWeave: Risk-adaptive encryption for agent requests,'' GitHub repository, 2026. [Online]. Available: \url{https://github.com/rajatarun/CipherWeave}
+\bibitem{comp-contracts} T.~Raja, ``Not all scores are probabilities: Typed, calibrated confidence contracts for composed agent systems,'' Zenodo preprint, 2026.
 \bibitem{lin1991} J.~Lin, ``Divergence measures based on the Shannon entropy,'' \emph{IEEE Trans. Inf. Theory}, vol.~37, no.~1, pp.~145--151, 1991.
 \bibitem{wagner2002} D.~Wagner and P.~Soto, ``Mimicry attacks on host-based intrusion detection systems,'' in \emph{Proc. ACM CCS}, 2002, pp.~255--264.
 \bibitem{sommer2010} R.~Sommer and V.~Paxson, ``Outside the closed world: On using machine learning for network intrusion detection,'' in \emph{Proc. IEEE S\&P}, 2010, pp.~305--316.
