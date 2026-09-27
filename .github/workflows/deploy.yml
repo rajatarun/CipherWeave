@@ -253,9 +253,39 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: cipherweave-seed-${{ github.run_id }}
 
+      # Memgraph's EC2 instance is stopped on weekends to save cost. A deploy
+      # then has nothing to seed, and the seed Lambda can only time out
+      # connecting to it -- which failed every weekend deploy even though the
+      # stack itself deployed. So ask EC2 first: seed only a *running*
+      # instance, and skip loudly (a warning annotation, not a red build) for
+      # any other state. The seed is MERGE-only, so the next deploy with
+      # Memgraph up fills it in.
+      #
+      # A running instance that still refuses the connection is NOT skipped:
+      # that is a real outage, and the seed step fails naming the host.
+      - name: Check Memgraph instance state
+        id: memgraph
+        run: |
+          INSTANCE_ID="${{ needs.deploy.outputs.memgraph_instance }}"
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "null" ]; then
+            echo "❌ memgraph_instance is empty — the deploy job did not resolve it"
+            exit 1
+          fi
+          STATE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text)
+          echo "Memgraph instance $INSTANCE_ID is $STATE"
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+          if [ "$STATE" = "running" ]; then
+            echo "running=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "running=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Memgraph not seeded::Memgraph instance $INSTANCE_ID is '$STATE' (stopped on weekends), so the graph was not seeded. The stack deployed; the next deploy with Memgraph running will seed it."
+          fi
+
       # The seed Lambda runs inside the VPC and reaches Memgraph on the private IP.
       # GitHub runners have no VPC access — Lambda invocation is the only path in.
       - name: Invoke SeedGraph Lambda
+        if: steps.memgraph.outputs.running == 'true'
         run: |
           SEED_ARN="${{ needs.deploy.outputs.seed_function_arn }}"
           if [ -z "$SEED_ARN" ]; then
@@ -315,9 +345,12 @@ jobs:
           echo "## Memgraph Seed" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Memgraph: \`${{ needs.deploy.outputs.memgraph_host }}:7687\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Instance state: \`${{ steps.memgraph.outputs.state }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "\`\`\`json" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f /tmp/seed_response.json ]; then
+          if [ "${{ steps.memgraph.outputs.running }}" != "true" ]; then
+            echo '{"status":"skipped","reason":"memgraph instance not running"}' >> "$GITHUB_STEP_SUMMARY"
+          elif [ -f /tmp/seed_response.json ]; then
             cat /tmp/seed_response.json >> "$GITHUB_STEP_SUMMARY"
           else
             echo '{"status":"no_response_file"}' >> "$GITHUB_STEP_SUMMARY"
