@@ -1,0 +1,132 @@
+{
+  "corpus": "v1",
+  "extended": true,
+  "n_per_class": 40,
+  "operating_points": {
+    "0.01": {
+      "theta": 4.8203,
+      "fpr": 0.01,
+      "fpr_ci": [
+        0.0018,
+        0.0545
+      ],
+      "fp_by_archetype": {
+        "steady_batch": {
+          "delta": 0.0,
+          "full": 0.0
+        },
+        "interactive": {
+          "delta": 0.0,
+          "full": 0.25
+        },
+        "crawler": {
+          "delta": 0.0,
+          "full": 0.0
+        },
+        "bursty_etl": {
+          "delta": 0.05,
+          "full": 0.35
+        },
+        "expanding": {
+          "delta": 0.0,
+          "full": 0.0
+        }
+      },
+      "tpr_by_attack": {
+        "exfil_burst": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "beacon": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "destination_entropy"
+        },
+        "scan": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "destination_entropy"
+        },
+        "downgrade": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "low_and_slow": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "mimicry": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        }
+      }
+    },
+    "0.05": {
+      "theta": 3.9341,
+      "fpr": 0.04,
+      "fpr_ci": [
+        0.0157,
+        0.0984
+      ],
+      "fp_by_archetype": {
+        "steady_batch": {
+          "delta": 0.0,
+          "full": 0.0
+        },
+        "interactive": {
+          "delta": 0.05,
+          "full": 0.25
+        },
+        "crawler": {
+          "delta": 0.0,
+          "full": 0.0
+        },
+        "bursty_etl": {
+          "delta": 0.15,
+          "full": 0.35
+        },
+        "expanding": {
+          "delta": 0.0,
+          "full": 0.0
+        }
+      },
+      "tpr_by_attack": {
+        "exfil_burst": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "beacon": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "destination_entropy"
+        },
+        "scan": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "destination_entropy"
+        },
+        "downgrade": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "low_and_slow": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "mimicry": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        }
+      }
+    }
+  },
+  "auc": 1.0
+}

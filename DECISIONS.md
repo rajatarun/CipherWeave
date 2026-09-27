@@ -231,3 +231,11 @@ FastMCP 3.x uses contextvars internally. Lifespan `__aenter__()` tokens must be 
 **Fail-secure, and not optional**: every failure — unreachable graph, unknown or unauthorized agent, unclassifiable metadata, timeout, defect under scoring — returns `QUANTUM_SAFE` with `fail_secure=True` and the cause recorded (ADR-001). The rejected alternative is to omit the field on failure, which would make "make CipherWeave unreachable" the cheapest downgrade attack available.
 
 **Trade-off**: the channel value checked at commit is reported by the executor, so the binding constrains a claim rather than measuring the wire. What it buys is that the requirement is decided by policy rather than by the executor, is immutable between the two phases (any edit is a MAC forgery), and is recorded — so a downgrade is either refused or attributable. Verified transport is out of scope, as key compromise is out of scope for the gate's own P3/P4.
+
+---
+
+## ADR-019: Extended drift channels ship off by default; evaluation split made stable
+
+**Decision**: `DriftDetector(extended=True)` adds inter-arrival regularity and a long-horizon sensitive-share channel to Eq. (3)'s max. Both server and Lambda keep constructing the detector with the default (`extended=False`). The E2 calibration/test split is a CRC-32 of the agent id, and measured FPRs carry a 95% Wilson interval.
+
+**Rationale**: On corpus v2 (realistic sensitive-data rates on benign traffic) the extended detector raises AUC from 0.788 to 0.923 and catches low-and-slow, mimicry and jittered low-and-slow at 100% (from 0–50%), but its test FPR at a 5% calibrated target is 11% (95% CI 6.3–18.6%) against Eq. (3)'s 7%. A fail-secure override that fires on one in nine benign agents is a cost to accept deliberately, not a side effect of a merge. `mimicry_full` — the victim's own distribution — stays at 10% under both, as it must; that attacker is authorization's job. The old `hash()` split moved the reported FPR between 2.1% and 6.9% with PYTHONHASHSEED alone. Full numbers and E3 post-quantum costs: `docs/evaluation-drift-and-pq-cost.md`.

@@ -28,11 +28,29 @@ Attack classes are shaped by what a credential-compromise adversary does
 channels of Eq. (3) happen to measure.
 
 Every episode is seeded and reproducible.
+
+CORPUS VERSIONS
+===============
+``v1`` is the corpus the paper's evaluation was run on and is unchanged.
+
+``v2`` exists because the extended detector channels (inter-arrival regularity
+and long-horizon sensitive share) would score a trivial win on v1, where benign
+traffic never carries a sensitive tag and every evasive attack does. v2 closes
+that gap before measuring anything:
+
+* benign archetypes carry sensitive data at realistic, archetype-specific rates
+  (and use a non-CHEAP profile for it, as a correctly configured agent would);
+* ``low_and_slow_jittered`` draws its gaps from an exponential at the victim's
+  mean rate, so it is not a regular script -- only its sensitive share can give
+  it away;
+* ``mimicry_full`` resamples the victim's empirical joint distribution of
+  endpoint, profile *and* tags, and its empirical gaps. It is distributionally
+  indistinguishable from the victim by construction; no detector that sees only
+  this traffic can catch it, and it is in the corpus to show where that bound is.
 """
 
 from __future__ import annotations
 
-import math
 import random
 from dataclasses import dataclass, field
 
@@ -41,7 +59,12 @@ from cipherweave.profiles import CipherProfile as P
 BENIGN_ARCHETYPES = ("steady_batch", "interactive", "crawler", "bursty_etl", "expanding")
 HARD_NEGATIVES = ("bursty_etl", "expanding")
 ATTACK_CLASSES = ("exfil_burst", "beacon", "scan", "downgrade", "low_and_slow", "mimicry")
-EVASIVE_ATTACKS = ("low_and_slow", "mimicry")
+EVASIVE_ATTACKS = ("low_and_slow", "mimicry", "low_and_slow_jittered", "mimicry_full")
+ATTACK_CLASSES_V2 = ATTACK_CLASSES + ("low_and_slow_jittered", "mimicry_full")
+
+#: v2 only: share of each benign archetype's requests that carry sensitive data.
+SENSITIVE_RATES_V2 = {"steady_batch": 0.30, "interactive": 0.15, "crawler": 0.02,
+                      "bursty_etl": 0.45, "expanding": 0.20}
 
 SENSITIVE_TAGS = ["PII", "PHI"]
 
@@ -103,8 +126,25 @@ def _zipf_endpoint(rng: random.Random, pool: list[str]) -> str:
     return pool[0]
 
 
-def _benign_stream(rng, archetype, pool, t0, duration):
+def _benign_stream(rng, archetype, pool, t0, duration, version="v1"):
     """Emit benign events for `duration` seconds starting at t0."""
+    events = _benign_stream_v1(rng, archetype, pool, t0, duration)
+    if version == "v1":
+        return events
+    # Tags come from a separate generator, drawn after the stream, so each
+    # stream's timing, endpoints and profiles are generated exactly as v1
+    # generates them and only the tags are added.
+    trng = random.Random(rng.random())
+    rate = SENSITIVE_RATES_V2[archetype]
+    for e in events:
+        if trng.random() < rate:
+            e.tags = list(SENSITIVE_TAGS)
+            if e.profile == P.CHEAP:
+                e.profile = P.BALANCED
+    return events
+
+
+def _benign_stream_v1(rng, archetype, pool, t0, duration):
     events, t = [], t0
     mix = _MIXES[archetype]
     end = t0 + duration
@@ -199,36 +239,55 @@ def _attack_stream(rng, attack, hist: list[Event], pool, t0, duration):
             events.append(Event(t, src.endpoint, src.profile, list(SENSITIVE_TAGS)))
             t += median_gap * rng.uniform(0.9, 1.1)
 
+    elif attack == "low_and_slow_jittered":
+        # Victim's endpoints and profiles at the victim's mean rate, Poisson
+        # timing: not a regular script. Still there for the sensitive data.
+        mean_gap = sum(gaps) / len(gaps)
+        while t < end:
+            events.append(Event(t, rng.choice(hist_eps), rng.choice(hist_profs),
+                                list(SENSITIVE_TAGS)))
+            t += rng.expovariate(1.0 / mean_gap)
+
+    elif attack == "mimicry_full":
+        # Resample the victim's joint (endpoint, profile, tags) and its gaps.
+        # Indistinguishable in distribution by construction: the bound.
+        while t < end:
+            src = rng.choice(hist)
+            events.append(Event(t, src.endpoint, src.profile, list(src.tags)))
+            t += rng.choice(gaps)
+
     return events
 
 
 def make_episode(seed: int, label: int, archetype: str,
                  baseline_seconds: float = 1200.0,
-                 eval_seconds: float = 600.0) -> Episode:
+                 eval_seconds: float = 600.0, version: str = "v1") -> Episode:
     rng = random.Random(seed)
     benign_kind = archetype if label == 0 else rng.choice(BENIGN_ARCHETYPES)
     pool_size = {"crawler": 45, "expanding": 20}.get(benign_kind, rng.randint(4, 9))
     pool = [f"ep_{seed}_{i}" for i in range(pool_size)]
 
-    baseline = _benign_stream(rng, benign_kind, pool, 0.0, baseline_seconds)
+    baseline = _benign_stream(rng, benign_kind, pool, 0.0, baseline_seconds, version)
     if not baseline:
         baseline = [Event(0.0, pool[0], P.BALANCED)]
 
     if label == 0:
-        evaluation = _benign_stream(rng, benign_kind, pool, baseline_seconds, eval_seconds)
+        evaluation = _benign_stream(rng, benign_kind, pool, baseline_seconds, eval_seconds, version)
         return Episode(f"ag_{seed}", 0, archetype, baseline, evaluation)
 
     evaluation = _attack_stream(rng, archetype, baseline, pool, baseline_seconds, eval_seconds)
     return Episode(f"ag_{seed}", 1, archetype, baseline, evaluation, attack_start=baseline_seconds)
 
 
-def build_corpus(n_per_class: int = 60, seed0: int = 10_000) -> list[Episode]:
+def build_corpus(n_per_class: int = 60, seed0: int = 10_000, version: str = "v1") -> list[Episode]:
     """Balanced over archetypes; prevalence is a property of this corpus, not of reality."""
+    if version not in ("v1", "v2"):
+        raise ValueError(f"unknown corpus version {version!r}")
     episodes, s = [], seed0
     for arch in BENIGN_ARCHETYPES:
         for _ in range(n_per_class):
-            episodes.append(make_episode(s, 0, arch)); s += 1
-    for arch in ATTACK_CLASSES:
+            episodes.append(make_episode(s, 0, arch, version=version)); s += 1
+    for arch in (ATTACK_CLASSES if version == "v1" else ATTACK_CLASSES_V2):
         for _ in range(n_per_class):
-            episodes.append(make_episode(s, 1, arch)); s += 1
+            episodes.append(make_episode(s, 1, arch, version=version)); s += 1
     return episodes

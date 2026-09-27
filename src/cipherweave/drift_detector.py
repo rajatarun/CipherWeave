@@ -24,6 +24,16 @@ Three properties are deliberate, not incidental:
   usable baseline, so delta_a := infinity and it receives the strongest profile
   until a baseline accumulates. Fail-secure, at a cost in warm-up.
 
+Two further channels are available with ``extended=True`` (see ``DriftDetector``):
+inter-arrival regularity and a long-horizon sensitive-data share. They answer
+the open problem the original three leave: an attacker who draws endpoints and
+profiles from the victim's own history, at the victim's own rate, moves none of
+entropy, rate or mix. What such an attacker usually cannot also hide is that it
+is a script (its request gaps are far more regular than organic traffic) and
+that it is there for the sensitive data (a slow rise in the share of PII/PHI
+requests, invisible in five minutes and plain over twenty). Both enter the same
+max, so each keeps unilateral authority to fire.
+
 Alongside the statistic, a small set of *semantic* rules (a downgrade request on
 sensitive data, a large strength drop, a first-seen endpoint) is retained as a
 separate raise-only channel. Those catch single-shot events that a distributional
@@ -76,6 +86,23 @@ BASELINE_SAMPLE_FRACTION: float = 0.25
 #: channel alike.
 WINDOW_MATURITY_FRACTION: float = 0.5
 
+#: Long-horizon window for the sensitive-share channel, as a multiple of the
+#: short window. A slow exfiltration that raises the PII share from 10% to 30%
+#: is noise over five minutes of a quiet agent and plain over ten.
+LONG_WINDOW_MULTIPLE: float = 2.0
+
+#: Per-event decay of the sensitive-share baseline (a memory of ~1000 events).
+#: The baseline is fed only by events that have *left* the long window, so it
+#: never contains the traffic it is compared against -- a baseline that learns
+#: from the window it tests absorbs a sustained attack before the window can
+#: show it, which is exactly what the first version of this channel did.
+SENSITIVE_BASELINE_DECAY: float = 0.999
+
+#: Lower bound on the baseline share used in the binomial standard error, so an
+#: agent that has never touched sensitive data does not produce an infinite z
+#: from its first tagged request -- it produces a large finite one.
+SENSITIVE_P_FLOOR: float = 0.02
+
 #: Operations exempt from override: side-effect-free and cannot mutate state.
 READ_ONLY_OPERATIONS: frozenset[str] = frozenset({"status", "health", "get_status"})
 
@@ -119,7 +146,7 @@ def js_divergence(p: list[float], q: list[float]) -> float:
 class _Baseline:
     """EWMA mean/variance for a scalar channel."""
 
-    __slots__ = ("mean", "var", "alpha", "n")
+    __slots__ = ("alpha", "mean", "n", "var")
 
     def __init__(self, alpha: float) -> None:
         self.mean = 0.0
@@ -152,6 +179,13 @@ class _AgentState:
         self.records: deque[tuple[float, CipherProfile, str]] = deque(maxlen=4096)
         self.entropy = _Baseline(alpha)
         self.rate = _Baseline(alpha)
+        # extended channels
+        self.gap_cv = _Baseline(alpha)
+        # (t, sensitive, learn): learn is False for decisions flagged as drift,
+        # which must not reach the baseline when they age out.
+        self.long_records: deque[tuple[float, bool, bool]] = deque(maxlen=16384)
+        self.sens_num = 0.0
+        self.sens_den = 0.0
         self.last_sample_t: float | None = None
         self.profile_mix: list[float] = [1.0 / len(_PROFILES)] * len(_PROFILES)
         self.alpha = alpha
@@ -167,15 +201,27 @@ class _AgentState:
 class DriftStatistic:
     """The value of Eq. (3) plus the per-channel terms that produced it."""
 
-    __slots__ = ("delta", "z_entropy", "z_rate", "z_mix", "cold_start", "window_size")
+    __slots__ = (
+        "cold_start",
+        "delta",
+        "window_size",
+        "z_entropy",
+        "z_mix",
+        "z_rate",
+        "z_regularity",
+        "z_sensitive",
+    )
 
-    def __init__(self, delta, z_entropy, z_rate, z_mix, cold_start, window_size):
+    def __init__(self, delta, z_entropy, z_rate, z_mix, cold_start, window_size,
+                 z_regularity=0.0, z_sensitive=0.0):
         self.delta = delta
         self.z_entropy = z_entropy
         self.z_rate = z_rate
         self.z_mix = z_mix
         self.cold_start = cold_start
         self.window_size = window_size
+        self.z_regularity = z_regularity
+        self.z_sensitive = z_sensitive
 
     def dominant_channel(self) -> str:
         if self.cold_start:
@@ -183,7 +229,9 @@ class DriftStatistic:
         return max(
             (("destination_entropy", self.z_entropy),
              ("request_rate", self.z_rate),
-             ("profile_mix", self.z_mix)),
+             ("profile_mix", self.z_mix),
+             ("interarrival_regularity", self.z_regularity),
+             ("sensitive_share", self.z_sensitive)),
             key=lambda kv: kv[1],
         )[0]
 
@@ -193,6 +241,8 @@ class DriftStatistic:
             "z_entropy": round(self.z_entropy, 4),
             "z_rate": round(self.z_rate, 4),
             "z_mix": round(self.z_mix, 4),
+            "z_regularity": round(self.z_regularity, 4),
+            "z_sensitive": round(self.z_sensitive, 4),
             "cold_start": self.cold_start,
             "window_size": self.window_size,
             "dominant_channel": self.dominant_channel(),
@@ -211,7 +261,15 @@ class DriftDetector:
         tau_js: float = DEFAULT_TAU_JS,
         window_seconds: float = DEFAULT_WINDOW_SECONDS,
         n_min: int = DEFAULT_N_MIN,
+        extended: bool = False,
     ) -> None:
+        """``extended`` adds the inter-arrival regularity and long-horizon
+        sensitive-share channels. Off by default so the deployed statistic stays
+        the one the paper's Eq. (3) and its evaluation describe until the
+        extended form's false-positive cost is accepted; ``evaluation/evaluate_e2.py
+        --extended`` measures both on the same corpus.
+        """
+        self._extended = extended
         self._window_size = window_size
         self._theta = theta
         self._alpha = alpha
@@ -241,9 +299,51 @@ class DriftDetector:
 
     def _evict(self, agent_id: str, now: float) -> None:
         cutoff = now - self._window_seconds
-        recs = self._state[agent_id].records
+        st = self._state[agent_id]
+        recs = st.records
         while recs and recs[0][0] < cutoff:
             recs.popleft()
+        long_cutoff = now - self._window_seconds * LONG_WINDOW_MULTIPLE
+        while st.long_records and st.long_records[0][0] < long_cutoff:
+            _, sensitive, learn = st.long_records.popleft()
+            if learn:
+                st.sens_num = SENSITIVE_BASELINE_DECAY * st.sens_num + (1.0 if sensitive else 0.0)
+                st.sens_den = SENSITIVE_BASELINE_DECAY * st.sens_den + 1.0
+
+    @staticmethod
+    def _gap_cv(window: list[tuple[float, CipherProfile, str]]) -> float | None:
+        """Coefficient of variation of inter-arrival gaps; None with too few gaps.
+
+        Organic traffic is roughly Poisson (CV near 1) or burstier; a script
+        sleeping a fixed interval, with or without a little jitter, sits near 0.
+        """
+        if len(window) < 3:
+            return None
+        gaps = [b[0] - a[0] for a, b in zip(window, window[1:], strict=False)]
+        mean = sum(gaps) / len(gaps)
+        if mean <= 0:
+            return None
+        var = sum((g - mean) ** 2 for g in gaps) / len(gaps)
+        return math.sqrt(var) / mean
+
+    def _extended_terms(self, st: _AgentState, window, now: float) -> tuple[float, float]:
+        # (iv) inter-arrival regularity -- one-sided: only *more regular* than baseline.
+        z_reg = 0.0
+        cv = self._gap_cv(window)
+        span = window[-1][0] - window[0][0]
+        if cv is not None and st.gap_cv.n > 0 and span >= WINDOW_MATURITY_FRACTION * self._window_seconds:
+            z_reg = max(st.gap_cv.mean - cv, 0.0) / st.gap_cv.scaled_sigma()
+
+        # (v) long-horizon sensitive share -- one-sided, binomial standard error.
+        z_sens = 0.0
+        n_long = len(st.long_records)
+        if n_long >= self._n_min and st.sens_den > 0:
+            p_hat = sum(1 for _, s, _ in st.long_records if s) / n_long
+            p0 = st.sens_num / st.sens_den
+            p_eff = min(max(p0, SENSITIVE_P_FLOOR), 1.0 - SENSITIVE_P_FLOOR)
+            se = math.sqrt(p_eff * (1.0 - p_eff) / n_long)
+            z_sens = max(p_hat - p0, 0.0) / se
+        return z_reg, z_sens
 
     def drift_statistic(self, agent_id: str, now: float | None = None) -> DriftStatistic:
         """Compute delta_a from the agent's trailing window against its EWMA baselines."""
@@ -287,7 +387,11 @@ class DriftDetector:
         q_hat = [c / total for c in mix_counts]
         z_mix = js_divergence(q_hat, st.profile_mix) / self._tau_js
 
-        return DriftStatistic(max(z_h, z_lam, z_mix), z_h, z_lam, z_mix, False, len(window))
+        z_reg = z_sens = 0.0
+        if self._extended:
+            z_reg, z_sens = self._extended_terms(st, window, now)
+        return DriftStatistic(max(z_h, z_lam, z_mix, z_reg, z_sens), z_h, z_lam, z_mix, False,
+                              len(window), z_reg, z_sens)
 
     # --- Detection -------------------------------------------------------
 
@@ -401,7 +505,9 @@ class DriftDetector:
         """
         now = time.monotonic() if now is None else now
         st = self._state[agent_id]
+        sensitive = bool(_SENSITIVE_TAGS & set(data_tags or []))
         st.records.append((now, profile, endpoint_id))
+        st.long_records.append((now, sensitive, update_baseline))
         self._evict(agent_id, now)
 
         if not update_baseline:
@@ -429,6 +535,9 @@ class DriftDetector:
                 ep_counts[ep] += 1
             st.entropy.update(shannon_entropy(ep_counts))
             st.rate.update(len(window) / self._window_seconds)
+            cv = self._gap_cv(window)
+            if cv is not None:
+                st.gap_cv.update(cv)
         st.update_mix(profile)
 
         self._history[agent_id].append(

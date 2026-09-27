@@ -1,0 +1,152 @@
+{
+  "corpus": "v2",
+  "extended": false,
+  "n_per_class": 40,
+  "operating_points": {
+    "0.01": {
+      "theta": 3.7163,
+      "fpr": 0.06,
+      "fpr_ci": [
+        0.0278,
+        0.1248
+      ],
+      "fp_by_archetype": {
+        "steady_batch": {
+          "delta": 0.0,
+          "full": 0.0
+        },
+        "interactive": {
+          "delta": 0.15,
+          "full": 0.2
+        },
+        "crawler": {
+          "delta": 0.0,
+          "full": 0.0
+        },
+        "bursty_etl": {
+          "delta": 0.15,
+          "full": 0.15
+        },
+        "expanding": {
+          "delta": 0.0,
+          "full": 0.0
+        }
+      },
+      "tpr_by_attack": {
+        "exfil_burst": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "request_rate"
+        },
+        "beacon": {
+          "delta": 0.95,
+          "full": 1.0,
+          "via": "destination_entropy"
+        },
+        "scan": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "destination_entropy"
+        },
+        "downgrade": {
+          "delta": 0.1,
+          "full": 1.0,
+          "via": "request_rate"
+        },
+        "low_and_slow": {
+          "delta": 0.3,
+          "full": 0.45,
+          "via": "request_rate"
+        },
+        "mimicry": {
+          "delta": 0.5,
+          "full": 0.65,
+          "via": "request_rate"
+        },
+        "low_and_slow_jittered": {
+          "delta": 0.0,
+          "full": 0.25,
+          "via": "-"
+        },
+        "mimicry_full": {
+          "delta": 0.1,
+          "full": 0.15,
+          "via": "request_rate"
+        }
+      }
+    },
+    "0.05": {
+      "theta": 3.1536,
+      "fpr": 0.07,
+      "fpr_ci": [
+        0.0343,
+        0.1375
+      ],
+      "fp_by_archetype": {
+        "steady_batch": {
+          "delta": 0.0,
+          "full": 0.0
+        },
+        "interactive": {
+          "delta": 0.2,
+          "full": 0.2
+        },
+        "crawler": {
+          "delta": 0.0,
+          "full": 0.0
+        },
+        "bursty_etl": {
+          "delta": 0.15,
+          "full": 0.15
+        },
+        "expanding": {
+          "delta": 0.0,
+          "full": 0.0
+        }
+      },
+      "tpr_by_attack": {
+        "exfil_burst": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "request_rate"
+        },
+        "beacon": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "destination_entropy"
+        },
+        "scan": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "destination_entropy"
+        },
+        "downgrade": {
+          "delta": 0.1,
+          "full": 1.0,
+          "via": "request_rate"
+        },
+        "low_and_slow": {
+          "delta": 0.3,
+          "full": 0.45,
+          "via": "request_rate"
+        },
+        "mimicry": {
+          "delta": 0.5,
+          "full": 0.65,
+          "via": "request_rate"
+        },
+        "low_and_slow_jittered": {
+          "delta": 0.0,
+          "full": 0.25,
+          "via": "-"
+        },
+        "mimicry_full": {
+          "delta": 0.1,
+          "full": 0.15,
+          "via": "request_rate"
+        }
+      }
+    }
+  },
+  "auc": 0.7883
+}

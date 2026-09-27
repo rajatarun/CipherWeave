@@ -1,0 +1,152 @@
+{
+  "corpus": "v2",
+  "extended": true,
+  "n_per_class": 40,
+  "operating_points": {
+    "0.01": {
+      "theta": 4.1514,
+      "fpr": 0.08,
+      "fpr_ci": [
+        0.0411,
+        0.15
+      ],
+      "fp_by_archetype": {
+        "steady_batch": {
+          "delta": 0.05,
+          "full": 0.15
+        },
+        "interactive": {
+          "delta": 0.15,
+          "full": 0.25
+        },
+        "crawler": {
+          "delta": 0.0,
+          "full": 0.05
+        },
+        "bursty_etl": {
+          "delta": 0.1,
+          "full": 0.15
+        },
+        "expanding": {
+          "delta": 0.1,
+          "full": 0.15
+        }
+      },
+      "tpr_by_attack": {
+        "exfil_burst": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "beacon": {
+          "delta": 0.95,
+          "full": 1.0,
+          "via": "destination_entropy"
+        },
+        "scan": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "destination_entropy"
+        },
+        "downgrade": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "low_and_slow": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "mimicry": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "low_and_slow_jittered": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "mimicry_full": {
+          "delta": 0.1,
+          "full": 0.15,
+          "via": "request_rate"
+        }
+      }
+    },
+    "0.05": {
+      "theta": 3.7363,
+      "fpr": 0.11,
+      "fpr_ci": [
+        0.0625,
+        0.1863
+      ],
+      "fp_by_archetype": {
+        "steady_batch": {
+          "delta": 0.05,
+          "full": 0.15
+        },
+        "interactive": {
+          "delta": 0.2,
+          "full": 0.25
+        },
+        "crawler": {
+          "delta": 0.0,
+          "full": 0.05
+        },
+        "bursty_etl": {
+          "delta": 0.15,
+          "full": 0.15
+        },
+        "expanding": {
+          "delta": 0.15,
+          "full": 0.15
+        }
+      },
+      "tpr_by_attack": {
+        "exfil_burst": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "beacon": {
+          "delta": 0.95,
+          "full": 1.0,
+          "via": "destination_entropy"
+        },
+        "scan": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "destination_entropy"
+        },
+        "downgrade": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "low_and_slow": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "mimicry": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "low_and_slow_jittered": {
+          "delta": 1.0,
+          "full": 1.0,
+          "via": "sensitive_share"
+        },
+        "mimicry_full": {
+          "delta": 0.1,
+          "full": 0.15,
+          "via": "request_rate"
+        }
+      }
+    }
+  },
+  "auc": 0.9226
+}

@@ -1,0 +1,25 @@
+{
+  "$comment": "Every score CipherWeave emits, declared against contracts/score_envelope.json (vendored from ContextWeave). tests/test_score_contract.py holds this file to the contract and resolves every producer.",
+  "scores": [
+    {
+      "name": "cipherweave.path_risk",
+      "kind": "risk_indicator",
+      "range": [0, 1],
+      "source": "heuristic",
+      "calibrated": false,
+      "evidence": "evidence_mass S and the paths that contributed to it (RiskAggregate)",
+      "meaning": "r = 1 - exp(-S) over graph evidence (Eq. 2). Monotone in the evidence mass and bounded; not a probability of compromise. Order on S when comparisons must stay strict.",
+      "producer": "cipherweave.scoring:normalize"
+    },
+    {
+      "name": "cipherweave.drift_delta",
+      "kind": "risk_indicator",
+      "range": [0, null],
+      "source": "measurement",
+      "calibrated": false,
+      "evidence": "window_size: decisions in the trailing window",
+      "meaning": "max over per-channel standardised deviations (Eq. 3, plus the extended channels when enabled), compared with theta. Unbounded above; a z-like score, not a probability. 0 with cold_start=true means no baseline, not no drift.",
+      "producer": "cipherweave.drift_detector:DriftDetector.drift_statistic"
+    }
+  ]
+}
