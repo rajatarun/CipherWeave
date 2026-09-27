@@ -21,7 +21,7 @@
 \maketitle
 
 \begin{abstract}
-CipherWeave chooses a cipher profile for each agent request from a risk graph. When a behavioural-drift statistic fires, it overrides the choice to the strongest (post-quantum) profile. Its evaluation left an open problem: attackers who imitate the victim's traffic, or move slowly, went largely undetected. We make four contributions. \emph{First}, we find that the reported false-positive rate depended on Python's per-process hash salt. The same corpus gave a measured FPR of 2.1\% or 6.9\% at a 5\% target, depending only on \texttt{PYTHONHASHSEED}. We make the calibration/test split stable, and we report Wilson intervals. \emph{Second}, we add two channels to the detector's max-combiner: inter-arrival regularity, and a long-horizon sensitive-data share whose baseline is kept disjoint from the window it tests. We prove when each fires (Lemma~\ref{lem:cv} and Theorem~\ref{thm:disjoint}), and show that max-combination preserves each channel's unilateral authority (Proposition~\ref{prop:max}). \emph{Third}, we prove that an attacker whose traffic has the victim's own distribution is caught at exactly the false-positive rate by \emph{any} detector (Theorem~\ref{thm:bound}), and we include such an attacker in a harder corpus. With realistic sensitive-data rates on benign traffic, the extended detector raises AUC from 0.788 to 0.923 and catches low-and-slow, mimicry and jittered low-and-slow attackers at 100\% (from 0--50\%). The full-mimicry attacker stays at 10\%, as the theorem requires. The cost is a test FPR of 11\% (95\% CI 6.3--18.6\%) at the 5\% target, so the extension ships disabled. \emph{Fourth}, we measure post-quantum costs with liboqs 0.16. A full ML-KEM-768 round trip (36.7\,$\mu$s median) costs less than one X25519 exchange (95.9\,$\mu$s). The real cost of the strongest profile is 2.2\,KB of extra key material on the wire.
+CipherWeave chooses a cipher profile for each agent request from a risk graph. When a behavioral-drift statistic fires, it overrides the choice to the strongest (post-quantum) profile. Its evaluation left an open problem: attackers who imitate the victim's traffic, or move slowly, went largely undetected. We make four contributions. \emph{First}, we find that the reported false-positive rate depended on Python's per-process hash salt. The same corpus gave a measured FPR of 2.1\% or 6.9\% at a 5\% target, depending only on \texttt{PYTHONHASHSEED}. We make the calibration/test split stable, and we report Wilson intervals. \emph{Second}, we add two channels to the detector's max-combiner: inter-arrival regularity, and a long-horizon sensitive-data share whose baseline is kept disjoint from the window it tests. We prove when each fires (Lemma~\ref{lem:cv} and Theorem~\ref{thm:disjoint}), and show that max-combination preserves each channel's unilateral authority (Proposition~\ref{prop:max}). \emph{Third}, we prove that an attacker whose traffic has the victim's own distribution is caught at exactly the false-positive rate by \emph{any} detector (Theorem~\ref{thm:bound}), and we include such an attacker in a harder corpus. With realistic sensitive-data rates on benign traffic, the extended detector raises AUC from 0.788 to 0.923 and catches low-and-slow, mimicry and jittered low-and-slow attackers at 100\% (from 0--50\%). The full-mimicry attacker stays at 10\%, as the theorem requires. The cost is a test FPR of 11\% (95\% CI 6.3--18.6\%) at the 5\% target, so the extension ships disabled. \emph{Fourth}, we measure post-quantum costs with liboqs 0.16. A full ML-KEM-768 round trip (36.7\,$\mu$s median) costs less than one X25519 exchange (95.9\,$\mu$s). The real cost of the strongest profile is 2.2\,KB of extra key material on the wire.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -29,7 +29,7 @@ anomaly detection, mimicry attacks, post-quantum cryptography, ML-KEM, risk-adap
 \end{IEEEkeywords}
 
 \section{Introduction}
-Risk-adaptive encryption selects cipher strength per request~\cite{prior-cipher}. A behavioural override protects against a compromised agent whose risk-graph context still looks benign. The override fires when a drift statistic
+Risk-adaptive encryption selects cipher strength per request~\cite{prior-cipher}. A behavioral override protects against a compromised agent whose risk-graph context still looks benign. The override fires when a drift statistic
 \begin{equation}
 \delta=\max\!\big(z_H,\;z_\lambda,\;z_{\mathrm{mix}}\big)\label{eq:delta}
 \end{equation}
@@ -39,7 +39,7 @@ exceeds $\theta$. Here $z_H$ is the standardized deviation of destination entrop
 Mimicry attacks against host-based anomaly detectors were shown by Wagner and Soto~\cite{wagner2002}. Sommer and Paxson~\cite{sommer2010} and Axelsson~\cite{axelsson2000} explain why low false-positive rates dominate the usefulness of network anomaly detection. Change detection for slow shifts traditionally uses CUSUM~\cite{page1954}. Our long-horizon channel is a windowed binomial test with a disjoint baseline. Public flow datasets such as CIC-IDS2017~\cite{sharafaldin2018} and UNSW-NB15~\cite{moustafa2015} provide recorded traffic. ML-KEM is standardized in FIPS~203~\cite{fips203}, and we measure it with the Open Quantum Safe library~\cite{stebila2016}.
 
 \section{Evaluation Hygiene}\label{sec:hygiene}
-The corpus has five benign archetypes, including two hard negatives (a bursty ETL job and an agent that onboards new endpoints), and six attack classes, including two designed to evade. Episodes are split 50/50 into calibration and test. The threshold is the $(1-\text{target})$ quantile of benign calibration scores, applied unchanged to the test split.
+The corpus has five benign archetypes, including two hard negatives (a bursty ETL job and an agent that onboards new endpoints), and six attack classes in corpus v1, including two designed to evade; corpus v2 (Section~\ref{sec:v2}) adds two more, for eight. Episodes are split 50/50 into calibration and test. The threshold is the $(1-\text{target})$ quantile of benign calibration scores, applied unchanged to the test split.
 
 The split used Python's \texttt{hash(agent\_id)}, which is salted per process. With seeds 1 and 2, the same corpus and code gave AUC 0.894 vs.\ 0.922, and a measured FPR at the 5\% target of 6.9\% vs.\ 2.1\%. A single reported FPR was therefore one draw of a number that moves by a factor of three. We now split by CRC-32 of the agent id, and report every FPR with a 95\% Wilson interval~\cite{wilson1927,brown2001}. On about 100 benign test episodes, a 5\% target is consistent with anywhere from roughly 2\% to 11\%.
 
@@ -77,7 +77,7 @@ Only events older than $t-W_L$ reach the baseline. For $t<t_0+W_L$ these all pre
 The first version of this channel updated $p_0$ on every event, including events inside the window. Under a sustained attack, $p_0$ then moves toward $p_1$ with every attack event, while $\hat p$, averaged over a long window, still contains mostly pre-attack events. So $\hat p-p_0\le0$ for a long stretch, and the channel reported zero. A unit test caught this: a rise from 10\% to 60\% sensitive share went undetected. Theorem~\ref{thm:disjoint} is the property the redesign guarantees.
 \end{remark}
 
-\begin{proposition}[Null behaviour]
+\begin{proposition}[Null behavior]
 Under no attack, with flags i.i.d.\ Bernoulli($p_0$) and $p_0$ inside the floor range, $z_{\mathrm{sens}}$ converges in distribution to $\max(Z,0)$ for $Z\sim\mathcal N(0,1)$ as $n\to\infty$. So $\Pr(z_{\mathrm{sens}}\ge3)\to1-\Phi(3)\approx0.00135$ per evaluation.
 \end{proposition}
 \begin{proof}
@@ -92,6 +92,7 @@ Let $\delta=\max_i z_i$ over channels $i=1..k$. Then $\delta\ge\theta$ iff some 
 \begin{proof}
 Both claims follow directly from the definitions of $\max$ and of the weighted mean.
 \end{proof}
+Taking the maximum is legitimate here because every channel is a standardized deviation computed by the same detector on the same agent's traffic, so the channels share a scale by construction. Rule R3 of our score-contract work forbids a maximum across \emph{producers}, where no common scale exists~\cite{comp-contracts}. The detector's output $\delta$ is itself one such producer's score, and is declared there as a risk indicator.
 
 \section{The Detectability Bound}\label{sec:bound}
 \begin{theorem}[Distributional mimicry is undetectable]\label{thm:bound}
@@ -100,9 +101,9 @@ Let $X$ be everything a detector observes about an agent over an episode. Let $P
 \begin{proof}
 $\Pr_{P}[D=\text{alarm}]=\int \Pr[D(x)=\text{alarm}]\,dP(x)$, where the inner probability accounts for $D$'s own randomness. The integrand is the same function under $P_0$ and $P_1$, and the measures are equal.
 \end{proof}
-The corpus attacker \texttt{mimicry\_full} resamples the victim's empirical joint distribution of endpoint, profile and tags, and its empirical inter-arrival gaps. It approximates $P_1=P_0$ up to finite-sample differences. Theorem~\ref{thm:bound} predicts that its detection rate matches the false-positive rate, and it does (Section~\ref{sec:results}). Catching such an attacker requires information outside $X$: payload, identity, or whether the agent is \emph{authorized} to reach an endpoint at all. CipherWeave enforces authorization deterministically in the risk graph, not statistically.
+The corpus attacker \texttt{mimicry\_full} resamples the victim's empirical joint distribution of endpoint, profile and tags, and its empirical inter-arrival gaps. It approximates $P_1=P_0$ up to finite-sample differences. Theorem~\ref{thm:bound} predicts that its detection rate matches the false-positive rate, and the measured rate is consistent with that prediction (Section~\ref{sec:results}). Catching such an attacker requires information outside $X$: payload, identity, or whether the agent is \emph{authorized} to reach an endpoint at all. CipherWeave enforces authorization deterministically in the risk graph, not statistically.
 
-\section{Corpus v2}
+\section{Corpus v2}\label{sec:v2}
 On the original corpus (v1), benign traffic never carries a sensitive tag and every evasive attack does, so a sensitive-share channel wins trivially: its AUC is 1.000. Corpus v2 closes that gap before measuring anything:
 \begin{itemize}
 \item benign archetypes carry sensitive data at archetype-specific rates (2--45\%), using a non-CHEAP profile for it as a correctly configured agent would;
@@ -150,9 +151,9 @@ mimicry\_full & 10\% & 10\% (rate)\\
 \end{tabular}
 \end{table}
 
-\textbf{What the numbers say.} The harder benign traffic of v2 costs Eq.~\eqref{eq:delta} 0.12 AUC by itself. The extended detector recovers it and more. It catches every attacker that is either a script or there for the sensitive data. As Theorem~\ref{thm:bound} requires, \texttt{mimicry\_full} is caught at about the false-positive rate: 10\% against 7--11\%. The cost is false positives: 11\% at the 5\% target, with new alarms on the \emph{expanding} (15\%) and \emph{steady\_batch} (5\%) archetypes. The threshold is calibrated on 100 benign episodes, and the extended score's heavier benign tail transfers worse. We therefore ship the extension \emph{disabled}, pending a larger calibration set or per-channel thresholds.
+\textbf{What the numbers say.} The harder benign traffic of v2 costs Eq.~\eqref{eq:delta} 0.12 AUC by itself (Table~\ref{tab:auc}). The extended detector recovers it and more. Table~\ref{tab:tpr} gives detection by attack class. The extended detector catches the low-and-slow, mimicry and jittered low-and-slow attackers, and the downgrade attacker, at 100\%, up from 0--50\%. Beacon detection falls from 100\% to 95\%. The beacon is still caught by the entropy channel, but the extended detector's calibrated threshold is higher (3.74 vs.\ 3.15), and one of the 20 test beacon episodes fell below it. Consistent with Theorem~\ref{thm:bound}, \texttt{mimicry\_full} is caught at about the false-positive rate: 10\% against 7--11\%. The cost is false positives: 11\% at the 5\% target, with new alarms on the \emph{expanding} (15\%) and \emph{steady\_batch} (5\%) archetypes. The threshold is calibrated on 100 benign episodes, and the extended score's heavier benign tail transfers worse. We therefore ship the extension \emph{disabled}, pending a larger calibration set or per-channel thresholds.
 
-\textbf{Recorded traffic.} A loader maps CICFlowMeter CSVs (CIC-IDS2017~\cite{sharafaldin2018}) to host episodes: source IP as the agent, destination IP:port as the endpoint, and a protocol-derived profile. Flow records carry no data-sensitivity label, so there the sensitive-share channel is inert by construction, and only the regularity channel is tested. \pend{Results pending: the dataset requires registration and was not downloaded in this environment; the loader is implemented and tested on synthetic CSVs.}
+\textbf{Recorded traffic.} A loader maps CICFlowMeter CSVs (CIC-IDS2017~\cite{sharafaldin2018}) to host episodes: source IP as the agent, destination IP:port as the endpoint, and a protocol-derived profile. Flow records carry no data-sensitivity label, so there the sensitive-share channel is inert by construction, and only the regularity channel is tested. The loader is released and tested on synthetic CSVs; evaluation on the recorded datasets is future work.
 
 \section{Post-Quantum Cost}
 We measured every primitive the profiles use, through the same libraries as the production code (Table~\ref{tab:pq}). Setup: Linux x86\_64, Python 3.12.3, OpenSSL 4.0.2, liboqs 0.16.0; 1{,}000 iterations after warm-up.
@@ -186,13 +187,14 @@ X25519 public key & \multicolumn{2}{r}{32 B}\\
 A full ML-KEM-768 round trip costs less than a single X25519 exchange. The QUANTUM\_SAFE profile's real cost is about 2.2\,KB more key material per establishment. The production hybrid path takes 219\,$\mu$s, more than its primitives combined (about 37 + 96\,$\mu$s). The extra time is overhead around the cryptography, from object construction and key re-parsing. At a fifth of a millisecond it does not threaten the service's 10\,ms p99 budget. Symmetric differences between profiles are a few microseconds.
 
 \section{Limitations}
-The corpus is synthetic, and the v2 sensitive-data rates are assumptions. Theorem~\ref{thm:disjoint} is about the expected score; tail behaviour under autocorrelated traffic is not analysed. The extended detector's false-positive cost is not yet acceptable for fail-secure deployment.
+The corpus is synthetic, and the v2 sensitive-data rates are assumptions. Theorem~\ref{thm:disjoint} is about the expected score; tail behavior under autocorrelated traffic is not analyzed. The extended detector's false-positive cost is not yet acceptable for fail-secure deployment.
 
 \section{Conclusion}
-Two longer-horizon channels close the mimicry gap for every attacker that is a script or is after sensitive data. A disjoint baseline is what keeps the slow attacker from teaching the detector to ignore it. The attacker these channels miss is one no traffic-only detector can catch, and we prove it. Post-quantum key establishment is cheap in CPU and costs bandwidth.
+Two longer-horizon channels close the mimicry gap for the low-and-slow, mimicry and downgrade attackers in our corpus, which are scripts, or are after sensitive data, or both. A disjoint baseline is what keeps the slow attacker from teaching the detector to ignore it. The attacker these channels miss is one no traffic-only detector can catch, and we prove it. Post-quantum key establishment is cheap in CPU and costs bandwidth.
 
 \begin{thebibliography}{99}
 \bibitem{prior-cipher} T.~Raja, \pend{title of the CipherWeave risk-adaptive encryption paper}, \pend{venue, year}.
+\bibitem{comp-contracts} T.~Raja, ``Not all scores are probabilities: Typed, calibrated confidence contracts for composed agent systems,'' companion paper, \pend{venue, year}.
 \bibitem{lin1991} J.~Lin, ``Divergence measures based on the Shannon entropy,'' \emph{IEEE Trans. Inf. Theory}, vol.~37, no.~1, pp.~145--151, 1991.
 \bibitem{wagner2002} D.~Wagner and P.~Soto, ``Mimicry attacks on host-based intrusion detection systems,'' in \emph{Proc. ACM CCS}, 2002.
 \bibitem{sommer2010} R.~Sommer and V.~Paxson, ``Outside the closed world: On using machine learning for network intrusion detection,'' in \emph{Proc. IEEE S\&P}, 2010.
