@@ -99,6 +99,10 @@ _CYPHER_STATEMENTS = [
 ]
 
 
+#: Seconds to wait for Memgraph to accept a connection before calling it down.
+MEMGRAPH_CONNECT_TIMEOUT_S: float = 10.0
+
+
 def _seed_graph() -> dict[str, Any]:
     """Connect to Memgraph and execute all MERGE statements. Returns result dict."""
     host = os.environ.get("CIPHERWEAVE_MEMGRAPH_HOST", "172.31.12.134")
@@ -113,7 +117,21 @@ def _seed_graph() -> dict[str, Any]:
         f"bolt://{host}:{port}",
         auth=None,
         encrypted=False,
+        connection_timeout=MEMGRAPH_CONNECT_TIMEOUT_S,
     )
+
+    # Ask once, up front, whether Memgraph answers at all. Without this an
+    # unreachable host was discovered separately by every statement below --
+    # each waiting out the driver's connect timeout and being counted as a
+    # "skip" -- so an outage surfaced as the whole function running into its
+    # 300 s timeout and the deploy seeing a dropped connection, naming nothing.
+    try:
+        driver.verify_connectivity()
+    except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+        driver.close()
+        message = f"Memgraph unreachable at {host}:{port}: {type(exc).__name__}: {exc}"
+        logger.error(message)
+        return {"status": "error", "message": message, "host": f"{host}:{port}"}
 
     ok_count = 0
     skip_count = 0
@@ -189,7 +207,10 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     try:
         result = _seed_graph()
         if event.get("ResponseURL"):
-            _cfn_send(event, context, "SUCCESS", result)
+            if result.get("status") == "error":
+                _cfn_send(event, context, "FAILED", {}, reason=result.get("message", "seed failed"))
+            else:
+                _cfn_send(event, context, "SUCCESS", result)
         return result
     except Exception as exc:
         logger.exception("Seed graph failed: %s", exc)
